@@ -37,12 +37,12 @@ jobs:
       if: matrix.os == 'windows-latest'
       uses: actions/upload-artifact@v4
       with:
-        name: Steam库管理助手_Windows_exe
-        path: dist/Steam库管理助手.exe
+        name: Steam_Library_Manager_Windows # 产物名改成英文
+        path: dist/Steam库管理助手.exe      # 路径保持不变
 
     - name: 保存打包结果 (MacOS)
       if: matrix.os == 'macos-latest'
       uses: actions/upload-artifact@v4
       with:
-        name: Steam库管理助手_MacOS_app
-        path: dist/Steam库管理助手.app
+        name: Steam_Library_Manager_MacOS   # 产物名改成英文
+        path: dist/Steam库管理助手.app      # 路径保持不变
