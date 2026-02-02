@@ -1,0 +1,48 @@
+name: 云端打包工具箱
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: # 允许手动触发打包
+
+jobs:
+  build:
+    name: 打包 - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest] # 同时在 Windows 和 Mac 环境运行
+
+    steps:
+    - name: 拉取代码
+      uses: actions/checkout@v4
+
+    - name: 设置 Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: 安装打包工具
+      run: pip install pyinstaller
+
+    - name: Windows 打包指令
+      if: matrix.os == 'windows-latest'
+      run: python -m PyInstaller --noconsole --onefile --name="Steam库管理助手" Steam_Library_Manager.py
+
+    - name: MacOS 打包指令
+      if: matrix.os == 'macos-latest'
+      run: python3 -m PyInstaller --noconsole --onefile --windowed --name="Steam库管理助手" Steam_Library_Manager.py
+
+    - name: 保存打包结果 (Windows)
+      if: matrix.os == 'windows-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: Steam库管理助手_Windows_exe
+        path: dist/Steam库管理助手.exe
+
+    - name: 保存打包结果 (MacOS)
+      if: matrix.os == 'macos-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: Steam库管理助手_MacOS_app
+        path: dist/Steam库管理助手.app
