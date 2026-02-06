@@ -3,6 +3,11 @@
 【AI 协作系统提示词 / System Prompt for AI Maintainers】
 如果你（AI）正在处理此文件，请务必遵守以下开发者习惯与规则：
 
+【确认机制】
+※ 如果你（AI）已完整阅读本导言区，并同意严格按照以下所有规则执行，
+  请在后续回复中首先向用户确认："已阅读导言区提示词，将严格按照规则执行。"
+  之后再进行具体的讨论或操作。
+
 【元规则 - 最高优先级】
 0. 【提示词协作】：允许 AI 根据与用户的交流情况，自发在本导言区增加或修改提示词，
    但每次增加或修改提示词前必须先与用户讨论并获得同意。
@@ -36,6 +41,17 @@
 12.【全局配置】：需要跨功能共享的配置项（如 Cookie）应在主界面提供统一的管理入口，
    并在所有相关子功能中全局调用。子功能界面应显示该配置项的当前状态，
    并说明配置后的效果。
+13.【主界面布局规范】：主界面采用紧凑布局，减少不必要的空间浪费，具体要求如下：
+   a) 【收藏夹列表置左】：收藏夹列表（"📂 当前收藏夹"面板）必须放在程序主界面的
+      最左侧，与 Steam 客户端的侧边栏风格保持一致。功能控制区在右侧。
+   b) 【备份管理就近放置】："💾 管理收藏夹备份"按钮应放置在"📂 当前收藏夹"标题
+      旁边（同一行），而不是作为独立的大按钮占据一整行。这样既节省空间又语义自然。
+   c) 【配置按钮并排】："🔑 管理登录态 Cookie" 和 "🎮 管理 IGDB API 凭证" 两个
+      按钮必须并排放置在同一行，而不是各自独占一行。
+   d) 【整体紧凑】：避免按钮独占整行、说明文字过多导致界面冗长的情况。
+      功能说明应尽量精简，能合并的按钮尽量合并在同一行。
+14.【增量修改】：生成代码时必须基于现有代码进行增量修改，严禁重新生成整个文件或整个方法。
+   应只输出需要变动的部分（如使用 diff/patch 或明确标注修改区域），以节省 token 开销。
 ================================================================================
 """
 
@@ -1019,28 +1035,11 @@ class SteamToolbox:
         return re.sub(r'[\\/*?:"<>|]', '_', name).strip()
 
     def _get_static_collections(self, data):
-        statics = []
-        for entry in data:
-            key = entry[0]
-            meta = entry[1]
-            if key.startswith("user-collections."):
-                if meta.get("is_deleted") is True or "value" not in meta:
-                    continue
-                try:
-                    val_obj = json.loads(meta['value'])
-                    if "filterSpec" not in val_obj:
-                        statics.append({
-                            "entry_ref": entry,
-                            "id": val_obj.get("id"),
-                            "name": val_obj.get("name"),
-                            "added": val_obj.get("added", [])
-                        })
-                except Exception:
-                    continue
-        return statics
-
-    def _get_all_collections_ordered(self, data):
-        """获取所有收藏夹（按 Steam 内顺序，包括动态收藏夹）"""
+        """获取所有收藏夹（含动态）及其 entry 引用，按字母排序"""
+        return self._get_all_collections_with_refs(data)
+    
+    def _get_all_collections_with_refs(self, data):
+        """获取所有收藏夹（含动态收藏夹）及其 entry 引用，按字母排序"""
         collections = []
         for entry in data:
             key = entry[0]
@@ -1051,14 +1050,45 @@ class SteamToolbox:
                 try:
                     val_obj = json.loads(meta['value'])
                     is_dynamic = "filterSpec" in val_obj
+                    icon = "🔍" if is_dynamic else "📁"
                     collections.append({
+                        "entry_ref": entry,
                         "id": val_obj.get("id"),
-                        "name": val_obj.get("name", "未命名"),
+                        "name": val_obj.get("name"),
                         "added": val_obj.get("added", []),
-                        "is_dynamic": is_dynamic
+                        "is_dynamic": is_dynamic,
+                        "display_name": f"{icon} {val_obj.get('name', '未命名')}"
                     })
                 except Exception:
                     continue
+        collections.sort(key=lambda c: (c.get('name') or '').lower())
+        return collections
+
+    def _get_all_collections_ordered(self, data):
+        """获取所有收藏夹（按字母顺序排序，与 Steam 客户端一致）"""
+        collections = []
+        for entry in data:
+            key = entry[0]
+            meta = entry[1]
+            if key.startswith("user-collections."):
+                if meta.get("is_deleted") is True or "value" not in meta:
+                    continue
+                try:
+                    val_obj = json.loads(meta['value'])
+                    is_dynamic = "filterSpec" in val_obj
+                    col_info = {
+                        "id": val_obj.get("id"),
+                        "name": val_obj.get("name", "未命名"),
+                        "added": val_obj.get("added", []),
+                        "removed": val_obj.get("removed", []),
+                        "is_dynamic": is_dynamic
+                    }
+                    if is_dynamic:
+                        col_info["filterSpec"] = val_obj.get("filterSpec")
+                    collections.append(col_info)
+                except Exception:
+                    continue
+        collections.sort(key=lambda c: c['name'].lower())
         return collections
 
     def _extract_ids_from_html(self, html_text):
@@ -1500,26 +1530,185 @@ class SteamToolbox:
             
         return len(added_list), len(removed_list), len(val_obj['added']), True
 
+    def _perform_replace_update(self, data, target_entry, new_ids):
+        """替换式更新：直接用新 ID 列表替换目标收藏夹的内容
+        
+        Returns:
+            (old_count, new_count)
+        """
+        val_obj = json.loads(target_entry[1]['value'])
+        old_count = len(val_obj.get("added", []))
+        
+        val_obj['added'] = new_ids
+        clean_name = val_obj.get('name', '').replace(self.induce_suffix, "").strip()
+        val_obj['name'] = f"{clean_name}{self.induce_suffix}"
+        target_entry[1]['value'] = json.dumps(val_obj, ensure_ascii=False, separators=(',', ':'))
+        target_entry[1]['timestamp'] = int(time.time())
+        target_entry[1]['version'] = self._next_version(data)
+        target_entry[1].setdefault('conflictResolutionMethod', 'custom')
+        target_entry[1].setdefault('strMethodId', 'union-collections')
+        
+        return old_count, len(new_ids)
+
+    # --- 收藏夹导出/导入（两种格式） ---
+    
+    def _export_collections_appid_list(self, collections):
+        """格式一：导出选中收藏夹的去重 AppID 列表（一行一个）
+        动态收藏夹只导出其 added 列表。"""
+        seen = set()
+        unique_ids = []
+        for col in collections:
+            for aid in col.get('added', []):
+                if aid not in seen:
+                    seen.add(aid)
+                    unique_ids.append(aid)
+        return unique_ids
+    
+    def _export_collections_structured(self, collections):
+        """格式二：导出选中收藏夹的完整结构化 JSON
+        包含名称、类型、appid、动态逻辑等。"""
+        export_data = {
+            "format": "steam_collections_structured",
+            "version": 1,
+            "exported_at": datetime.now().isoformat(),
+            "collections": []
+        }
+        for col in collections:
+            entry = {
+                "name": col.get("name", "未命名"),
+                "is_dynamic": col.get("is_dynamic", False),
+                "added": col.get("added", []),
+                "removed": col.get("removed", []),
+            }
+            if col.get("is_dynamic") and col.get("filterSpec"):
+                entry["filterSpec"] = col["filterSpec"]
+            export_data["collections"].append(entry)
+        return export_data
+    
+    def _import_collections_appid_list(self, file_path, data):
+        """格式一：导入一行一个 AppID 的列表文件，创建一个新收藏夹"""
+        file_title = os.path.splitext(os.path.basename(file_path))[0]
+        with open(file_path, 'r', encoding='utf-8') as f:
+            app_ids = [int(line.strip()) for line in f if line.strip().isdigit()]
+        if not app_ids:
+            return None, "文件中没有有效的 AppID。"
+        self._add_static_collection(data, file_title, app_ids)
+        return len(app_ids), None
+    
+    def _import_collections_structured(self, file_path, data):
+        """格式二：导入结构化 JSON 文件，还原多个收藏夹（含动态逻辑）"""
+        with open(file_path, 'r', encoding='utf-8') as f:
+            import_data = json.load(f)
+        
+        if import_data.get("format") != "steam_collections_structured":
+            return None, "文件格式不匹配：缺少 format 标识。"
+        
+        imported_cols = import_data.get("collections", [])
+        if not imported_cols:
+            return None, "文件中没有收藏夹数据。"
+        
+        count = 0
+        for col in imported_cols:
+            name = col.get("name", "导入的收藏夹")
+            is_dynamic = col.get("is_dynamic", False)
+            added = col.get("added", [])
+            removed = col.get("removed", [])
+            
+            if is_dynamic and "filterSpec" in col:
+                # 还原动态收藏夹
+                col_id = f"uc-{secrets.token_hex(4)}"
+                storage_key = f"user-collections.{col_id}"
+                val_obj = {
+                    "id": col_id,
+                    "name": name + self.induce_suffix,
+                    "added": added,
+                    "removed": removed,
+                    "filterSpec": col["filterSpec"]
+                }
+                new_entry = [storage_key, {
+                    "key": storage_key,
+                    "timestamp": int(time.time()),
+                    "value": json.dumps(val_obj, ensure_ascii=False, separators=(',', ':')),
+                    "version": self._next_version(data),
+                    "conflictResolutionMethod": "custom",
+                    "strMethodId": "union-collections"
+                }]
+                data.append(new_entry)
+            else:
+                # 静态收藏夹
+                self._add_static_collection(data, name.replace(self.induce_suffix, "").strip(), added)
+            count += 1
+        
+        return count, None
+
     # --- 1. 批量导入 ---
     def import_from_txt(self):
-        data = self.load_json()
-        if data is None: return
-        txt_paths = filedialog.askopenfilenames(
-            initialdir=self.current_dir, title="选择 AppID 列表 (TXT)",
-            filetypes=[("Text files", "*.txt")]
-        )
-        if not txt_paths: return
-        import_stats = []
-        for path in txt_paths:
-            file_title = os.path.splitext(os.path.basename(path))[0]
-            with open(path, 'r', encoding='utf-8') as f:
-                app_ids = [int(line.strip()) for line in f if line.strip().isdigit()]
-            if not app_ids: continue
-            self._add_static_collection(data, file_title, app_ids)
-            import_stats.append(f"• {file_title}: {len(app_ids)} 个 AppID")
-        self.save_json(data, backup_description="批量导入收藏夹")
-        if import_stats:
-            messagebox.showinfo("导入统计", "导入任务完成！各文件录入数量如下：\n" + "\n".join(import_stats) + self.disclaimer)
+        """批量导入：选择 TXT（多个 AppID 列表）或 JSON（结构化收藏夹）"""
+        fmt_win = tk.Toplevel()
+        fmt_win.title("批量导入收藏夹")
+        fmt_win.attributes("-topmost", True)
+        fmt_win.resizable(False, False)
+        
+        tk.Label(fmt_win, text="请选择要导入的文件格式：",
+                 font=("微软雅黑", 10), pady=10).pack(padx=20)
+        
+        def import_txt():
+            fmt_win.destroy()
+            paths = filedialog.askopenfilenames(
+                initialdir=self.current_dir, title="选择 AppID 列表文件（TXT）",
+                filetypes=[("Text files", "*.txt")])
+            if not paths:
+                return
+            data = self.load_json()
+            if data is None:
+                return
+            existing = self._get_all_collections_ordered(data)
+            self._original_col_ids = {c['id'] for c in existing}
+            results = []
+            for p in paths:
+                count, err = self._import_collections_appid_list(p, data)
+                fname = os.path.basename(p)
+                if err:
+                    results.append(f"❌ {fname}: {err}")
+                else:
+                    results.append(f"✅ {fname}: {count} 个 AppID")
+            self._ui_mark_dirty(data)
+            self._ui_refresh()
+            messagebox.showinfo("导入完成",
+                "导入结果：\n" + "\n".join(results) + "\n\n请点击「💾 储存更改」写入文件。")
+        
+        def import_json():
+            fmt_win.destroy()
+            path = filedialog.askopenfilename(
+                initialdir=self.current_dir, title="选择结构化收藏夹文件（JSON）",
+                filetypes=[("JSON files", "*.json")])
+            if not path:
+                return
+            data = self.load_json()
+            if data is None:
+                return
+            existing = self._get_all_collections_ordered(data)
+            self._original_col_ids = {c['id'] for c in existing}
+            try:
+                count, err = self._import_collections_structured(path, data)
+                if err:
+                    messagebox.showerror("导入失败", err)
+                    return
+                self._ui_mark_dirty(data)
+                self._ui_refresh()
+                messagebox.showinfo("导入完成",
+                    f"✅ 已导入 {count} 个收藏夹。\n\n请点击「💾 储存更改」写入文件。")
+            except json.JSONDecodeError:
+                messagebox.showerror("导入失败", "文件不是有效的 JSON 格式。")
+            except Exception as e:
+                messagebox.showerror("导入失败", f"导入时出错：{e}")
+        
+        tk.Button(fmt_win, text="📄 导入 AppID 列表（TXT）\n文件名将成为收藏夹名称",
+                  command=import_txt, font=("微软雅黑", 9), width=32, height=3,
+                  justify=tk.LEFT).pack(padx=20, pady=(5, 5))
+        tk.Button(fmt_win, text="📦 导入结构化数据（JSON）\n还原收藏夹名称及动态逻辑",
+                  command=import_json, font=("微软雅黑", 9), width=32, height=3,
+                  justify=tk.LEFT).pack(padx=20, pady=(0, 10))
 
     def _next_version(self, data):
         """扫描全部条目，返回下一个可用的全局版本号（字符串）"""
@@ -1544,69 +1733,320 @@ class SteamToolbox:
 
     # --- 2. 批量导出 ---
     def export_static_collection(self):
-        data = self.load_json()
-        if data is None: return
-        statics = self._get_static_collections(data)
-        if not statics:
-            messagebox.showwarning("提示", "未找到任何有效的静态收藏夹。")
+        """批量导出：使用左侧勾选的收藏夹，三种格式可选"""
+        selected = self._ui_get_selected()
+        if not selected:
+            messagebox.showwarning("提示", "请先在左侧勾选要导出的收藏夹。")
             return
-        export_win = tk.Toplevel(); export_win.title("批量导出静态收藏夹"); export_win.attributes("-topmost", True)
-        tk.Label(export_win, text="请选择一个或多个静态收藏夹进行导出 (Ctrl/Shift多选):", pady=10).pack()
-        listbox = tk.Listbox(export_win, width=50, height=12, selectmode=tk.MULTIPLE)
-        listbox.pack(padx=20, pady=5)
-        for s in statics: listbox.insert(tk.END, s['name'])
-        def do_export():
-            selected = listbox.curselection()
-            if not selected: return
+        
+        fmt_win = tk.Toplevel()
+        fmt_win.title("批量导出收藏夹")
+        fmt_win.attributes("-topmost", True)
+        fmt_win.resizable(False, False)
+        
+        tk.Label(fmt_win, text=f"已选中 {len(selected)} 个收藏夹，请选择导出格式：",
+                 font=("微软雅黑", 10), pady=10).pack(padx=20)
+        
+        def export_merged_appid():
+            fmt_win.destroy()
+            unique_ids = self._export_collections_appid_list(selected)
+            if not unique_ids:
+                messagebox.showwarning("提示", "选中的收藏夹没有可导出的 AppID。")
+                return
+            save_path = filedialog.asksaveasfilename(
+                initialdir=self.current_dir, title="保存合并 AppID 列表",
+                defaultextension=".txt", initialfile="merged_appids.txt",
+                filetypes=[("Text files", "*.txt")])
+            if save_path:
+                with open(save_path, 'w', encoding='utf-8') as f:
+                    for aid in unique_ids:
+                        f.write(f"{aid}\n")
+                messagebox.showinfo("✅ 导出成功",
+                    f"已导出 {len(unique_ids)} 个去重 AppID。\n（来自 {len(selected)} 个收藏夹）")
+        
+        def export_multiple_txt():
+            fmt_win.destroy()
             dest_dir = filedialog.askdirectory(initialdir=self.current_dir, title="选择保存导出文件的文件夹")
-            if not dest_dir: return
-            for idx in selected:
-                target = statics[idx]; safe_name = self._sanitize_filename(target['name'])
+            if not dest_dir:
+                return
+            count = 0
+            for col in selected:
+                safe_name = self._sanitize_filename(col['name'])
+                # 动态收藏夹只导出额外添加的 appid
+                app_ids = col.get('added', [])
+                if not app_ids:
+                    continue
                 with open(os.path.join(dest_dir, f"{safe_name}.txt"), 'w', encoding='utf-8') as f:
-                    for aid in target['added']: f.write(f"{aid}\n")
-            messagebox.showinfo("成功", f"任务结束：共成功导出 {len(selected)} 个文件。")
-            export_win.destroy()
-        tk.Button(export_win, text="确认导出选中项", command=do_export, width=20).pack(pady=10)
+                    for aid in app_ids:
+                        f.write(f"{aid}\n")
+                count += 1
+            messagebox.showinfo("✅ 导出成功",
+                f"共导出 {count} 个 TXT 文件到：\n{dest_dir}")
+        
+        def export_structured_json():
+            fmt_win.destroy()
+            export_data = self._export_collections_structured(selected)
+            save_path = filedialog.asksaveasfilename(
+                initialdir=self.current_dir, title="保存收藏夹结构化数据",
+                defaultextension=".json", initialfile="exported_collections.json",
+                filetypes=[("JSON files", "*.json")])
+            if save_path:
+                with open(save_path, 'w', encoding='utf-8') as f:
+                    json.dump(export_data, f, ensure_ascii=False, indent=2)
+                messagebox.showinfo("✅ 导出成功",
+                    f"已导出 {len(selected)} 个收藏夹的完整结构。\n（含名称、分类信息及动态逻辑）")
+        
+        tk.Button(fmt_win, text="📄 合并为单个 AppID 列表（TXT）\n所有选中收藏夹的 AppID 去重合并",
+                  command=export_merged_appid, font=("微软雅黑", 9), width=36, height=3,
+                  justify=tk.LEFT).pack(padx=20, pady=(5, 5))
+        tk.Button(fmt_win, text="📁 导出为多个 TXT 文件\n每个收藏夹一个文件，动态收藏夹仅导出额外添加部分",
+                  command=export_multiple_txt, font=("微软雅黑", 9), width=36, height=3,
+                  justify=tk.LEFT).pack(padx=20, pady=(0, 5))
+        tk.Button(fmt_win, text="📦 导出为结构化数据（JSON）\n含名称、分类、动态逻辑，可用于完整还原",
+                  command=export_structured_json, font=("微软雅黑", 9), width=36, height=3,
+                  justify=tk.LEFT).pack(padx=20, pady=(0, 10))
 
-    # --- 3. 批量更新 (TXT 增量确认) ---
+    # --- 3. 批量更新 ---
     def update_static_collection(self):
-        txt_paths = filedialog.askopenfilenames(
-            initialdir=self.current_dir, title="选择 AppID 列表 (TXT)",
-            filetypes=[("Text files", "*.txt")]
-        )
-        if not txt_paths: return
-        data = self.load_json()
-        if data is None: return
-        statics = self._get_static_collections(data)
-        if not statics:
-            messagebox.showwarning("提示", "未找到可更新的静态收藏夹。")
-            return
-        total_files = len(txt_paths)
-        def process_next_file(index):
-            if index >= total_files:
-                self.save_json(data, backup_description="批量更新收藏夹"); return
-            path = txt_paths[index]; file_title = os.path.splitext(os.path.basename(path))[0]
-            with open(path, 'r', encoding='utf-8') as f:
-                new_ids = [int(line.strip()) for line in f if line.strip().isdigit()]
-            update_win = tk.Toplevel(); update_win.title(f"批量更新进度: {index + 1} / {total_files}"); update_win.attributes("-topmost", True)
-            tk.Label(update_win, text=f"正在处理文件: {file_title}.txt\n请选择要【增量更新】的收藏夹：", pady=10).pack(padx=20)
-            listbox = tk.Listbox(update_win, width=50, height=10, selectmode=tk.SINGLE)
-            listbox.pack(padx=20, pady=5)
-            for s in statics: listbox.insert(tk.END, s['name'])
-            def on_confirm():
-                idx = listbox.curselection()
-                if not idx: return
-                target = statics[idx[0]]
-                a, r, t, updated = self._perform_incremental_update(data, target['entry_ref'], new_ids, target['name'])
-                if not updated:
-                    messagebox.showinfo("已是最新", f"该列表已是最新，无需更新。\n\n• 当前总计: {t} 个游戏\n• 来源比收藏夹少: {r} 个")
+        """批量更新：选择来源格式（TXT 或 JSON），然后一屏映射所有来源到目标收藏夹"""
+        fmt_win = tk.Toplevel()
+        fmt_win.title("批量更新收藏夹")
+        fmt_win.attributes("-topmost", True)
+        fmt_win.resizable(False, False)
+        
+        tk.Label(fmt_win, text="请选择用于更新的来源文件格式：",
+                 font=("微软雅黑", 10), pady=10).pack(padx=20)
+        
+        def update_from_txt():
+            fmt_win.destroy()
+            txt_paths = filedialog.askopenfilenames(
+                initialdir=self.current_dir, title="选择 AppID 列表 (TXT)",
+                filetypes=[("Text files", "*.txt")])
+            if not txt_paths:
+                return
+            data = self.load_json()
+            if data is None:
+                return
+            all_cols = self._get_all_collections_with_refs(data)
+            if not all_cols:
+                messagebox.showwarning("提示", "未找到任何收藏夹。")
+                return
+            
+            sources = {}
+            for p in txt_paths:
+                file_title = os.path.splitext(os.path.basename(p))[0]
+                with open(p, 'r', encoding='utf-8') as f:
+                    ids = [int(line.strip()) for line in f if line.strip().isdigit()]
+                sources[file_title] = {"name": file_title, "ids": ids}
+            
+            existing = self._get_all_collections_ordered(data)
+            self._original_col_ids = {c['id'] for c in existing}
+            
+            def on_done():
+                self._ui_mark_dirty(data)
+                self._ui_refresh()
+            
+            self._show_batch_update_mapping(data, all_cols, sources, on_done)
+        
+        def update_from_json():
+            fmt_win.destroy()
+            path = filedialog.askopenfilename(
+                initialdir=self.current_dir, title="选择结构化收藏夹文件（JSON）",
+                filetypes=[("JSON files", "*.json")])
+            if not path:
+                return
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    import_data = json.load(f)
+                if import_data.get("format") != "steam_collections_structured":
+                    messagebox.showerror("格式错误", "文件不是有效的结构化收藏夹文件。")
+                    return
+                src_cols = import_data.get("collections", [])
+                if not src_cols:
+                    messagebox.showerror("无数据", "文件中没有收藏夹数据。")
+                    return
+            except json.JSONDecodeError:
+                messagebox.showerror("格式错误", "文件不是有效的 JSON。")
+                return
+            except Exception as e:
+                messagebox.showerror("读取失败", f"读取文件出错：{e}")
+                return
+            
+            data = self.load_json()
+            if data is None:
+                return
+            all_cols = self._get_all_collections_with_refs(data)
+            if not all_cols:
+                messagebox.showwarning("提示", "未找到任何收藏夹。")
+                return
+            
+            existing = self._get_all_collections_ordered(data)
+            self._original_col_ids = {c['id'] for c in existing}
+            
+            sources = {}
+            for i, src in enumerate(src_cols):
+                key = src.get("name", f"收藏夹 {i + 1}")
+                sources[key] = {"name": key, "ids": src.get("added", [])}
+            
+            def on_done():
+                self._ui_mark_dirty(data)
+                self._ui_refresh()
+            
+            self._show_batch_update_mapping(data, all_cols, sources, on_done)
+        
+        tk.Button(fmt_win, text="📄 从 TXT 文件更新\n选择多个 AppID 列表文件",
+                  command=update_from_txt, font=("微软雅黑", 9), width=32, height=3,
+                  justify=tk.LEFT).pack(padx=20, pady=(5, 5))
+        tk.Button(fmt_win, text="📦 从 JSON 文件更新\n使用结构化收藏夹数据",
+                  command=update_from_json, font=("微软雅黑", 9), width=32, height=3,
+                  justify=tk.LEFT).pack(padx=20, pady=(0, 10))
+    
+    def _show_batch_update_mapping(self, data, all_cols, sources, on_done, parent_to_close=None, saved_mappings_key=None):
+        """通用的批量更新映射界面：一屏选择所有来源到目标收藏夹+更新模式"""
+        up_win = tk.Toplevel()
+        up_win.title("批量更新收藏夹")
+        up_win.attributes("-topmost", True)
+        
+        tk.Label(up_win, text="请为每个来源选择目标收藏夹和更新模式：",
+                 font=("微软雅黑", 10, "bold")).pack(pady=(15, 10))
+        
+        mapping_frame = tk.Frame(up_win)
+        mapping_frame.pack(fill=tk.BOTH, expand=True, padx=30, pady=(0, 10))
+        
+        target_names = ["（跳过）"] + [c['display_name'] for c in all_cols]
+        mode_options = ["增量", "替换"]
+        combo_vars = {}
+        
+        # 加载上次保存的映射选择
+        saved_mappings = {}
+        if saved_mappings_key:
+            config = self._load_config()
+            saved_mappings = config.get(saved_mappings_key, {})
+        
+        max_target_len = max(len(n) for n in target_names) if target_names else 20
+        
+        def _create_row(parent, key, d):
+            row_frame = tk.Frame(parent)
+            row_frame.pack(fill=tk.X, pady=5)
+            tk.Label(row_frame, text=f"📦 {d['name']} ({len(d['ids'])} 个)",
+                     font=("微软雅黑", 9), anchor=tk.W).pack(side=tk.LEFT)
+            tk.Label(row_frame, text="→", font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=10)
+            combo = ttk.Combobox(row_frame, values=target_names,
+                                  width=max(30, max_target_len + 2), state="readonly")
+            # 尝试恢复上次的选择
+            last_sel = saved_mappings.get(key, "")
+            if last_sel and last_sel in target_names:
+                combo.set(last_sel)
+            else:
+                combo.set("（跳过）")
+            combo.pack(side=tk.LEFT)
+            mode_combo = ttk.Combobox(row_frame, values=mode_options, width=6, state="readonly")
+            mode_combo.set("增量")
+            mode_combo.pack(side=tk.LEFT, padx=(5, 0))
+            combo_vars[key] = (combo, mode_combo)
+            return row_frame
+        
+        if len(sources) <= 8:
+            for key, d in sources.items():
+                _create_row(mapping_frame, key, d)
+        else:
+            canvas = tk.Canvas(mapping_frame, height=300)
+            scrollbar = ttk.Scrollbar(mapping_frame, orient="vertical", command=canvas.yview)
+            scrollable_frame = tk.Frame(canvas)
+            scrollable_frame.bind("<Configure>",
+                                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+            canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+            canvas.configure(yscrollcommand=scrollbar.set)
+            scrollbar.pack(side="right", fill="y")
+            canvas.pack(side="left", fill="both", expand=True)
+            def _on_mw(event):
+                if event.delta:
+                    canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                elif event.num == 4:
+                    canvas.yview_scroll(-1, "units")
+                elif event.num == 5:
+                    canvas.yview_scroll(1, "units")
+            for w in (canvas, scrollable_frame, up_win):
+                w.bind("<MouseWheel>", _on_mw)
+                w.bind("<Button-4>", _on_mw)
+                w.bind("<Button-5>", _on_mw)
+            for key, d in sources.items():
+                row = _create_row(scrollable_frame, key, d)
+                row.bind("<MouseWheel>", _on_mw)
+                row.bind("<Button-4>", _on_mw)
+                row.bind("<Button-5>", _on_mw)
+            scrollable_frame.update_idletasks()
+            canvas.config(width=scrollable_frame.winfo_reqwidth())
+        
+        def confirm_update():
+            update_count = 0
+            skipped_count = 0
+            results = []
+            
+            # 保存当前的映射选择以便下次使用
+            if saved_mappings_key:
+                config = self._load_config()
+                current_mappings = {}
+                for key, (combo, _) in combo_vars.items():
+                    sel = combo.get()
+                    if sel != "（跳过）":
+                        current_mappings[key] = sel
+                config[saved_mappings_key] = current_mappings
+                self._save_config(config)
+            
+            for key, (combo, mode_combo) in combo_vars.items():
+                selected_display = combo.get()
+                if selected_display == "（跳过）":
+                    continue
+                target = None
+                for c in all_cols:
+                    if c['display_name'] == selected_display:
+                        target = c
+                        break
+                if not target:
+                    continue
+                source_data = sources[key]
+                mode = mode_combo.get()
+                if mode == "替换":
+                    old_count, new_count = self._perform_replace_update(
+                        data, target['entry_ref'], source_data['ids'])
+                    results.append(f"🔄 {source_data['name']} → {target['name']}\n   替换: {old_count} → {new_count}")
+                    update_count += 1
                 else:
-                    messagebox.showinfo("更新完成", f"已增量更新至收藏夹。\n\n• 比旧版多的: {a} 个\n• 比旧版少的: {r} 个\n• 更新后总计: {t} 个" + self.disclaimer)
-                update_win.destroy(); process_next_file(index + 1)
-            btn_frame = tk.Frame(update_win); btn_frame.pack(pady=15)
-            tk.Button(btn_frame, text="确认更新此收藏夹", command=on_confirm, width=18).pack(side=tk.LEFT, padx=5)
-            tk.Button(btn_frame, text="跳过", command=lambda: [update_win.destroy(), process_next_file(index + 1)], width=12).pack(side=tk.LEFT, padx=5)
-        process_next_file(0)
+                    a, r, t, updated = self._perform_incremental_update(
+                        data, target['entry_ref'], source_data['ids'], target['name'])
+                    if updated:
+                        results.append(f"✅ {source_data['name']} → {target['name']}\n   新增: {a}, 移除: {r}, 总计: {t}")
+                        update_count += 1
+                    else:
+                        results.append(f"⏭️ {source_data['name']} → {target['name']}\n   已是最新，跳过")
+                        skipped_count += 1
+            if update_count > 0:
+                result_text = "\n".join(results)
+                messagebox.showinfo("更新完成",
+                    f"已更新 {update_count} 个收藏夹，跳过 {skipped_count} 个：\n\n{result_text}" + self.disclaimer)
+                up_win.destroy()
+                if parent_to_close:
+                    parent_to_close.destroy()
+                on_done()
+            elif skipped_count > 0:
+                result_text = "\n".join(results)
+                messagebox.showinfo("全部已是最新",
+                    f"所有选中的收藏夹都已是最新。\n\n{result_text}")
+                up_win.destroy()
+            else:
+                messagebox.showwarning("提示", "未选择任何目标收藏夹。")
+        
+        btn_row = tk.Frame(up_win)
+        btn_row.pack(pady=15)
+        tk.Button(btn_row, text="✅ 确认更新", command=confirm_update, width=15).pack(side=tk.LEFT, padx=10)
+        tk.Button(btn_row, text="取消", command=up_win.destroy, width=10).pack(side=tk.LEFT, padx=10)
+    
+    def _show_update_target_dialog(self, data, all_cols, new_ids, source_name, index, total, on_next):
+        """单来源更新的快捷入口，内部调用 _show_batch_update_mapping"""
+        sources = {source_name: {"name": source_name, "ids": new_ids}}
+        self._show_batch_update_mapping(data, all_cols, sources, on_next)
+
 
     # --- 4. 动态好友同步 ---
     def open_friend_sync_ui(self):
@@ -1691,82 +2131,19 @@ class SteamToolbox:
         tk.Button(ex_frame, text="🌐 浏览器打开", fg="gray", relief=tk.FLAT, font=("微软雅黑", 8),
                   command=lambda: webbrowser.open(url_entry.get().strip())).pack(side=tk.RIGHT)
         
-        # Cookie 区域
-        cookie_expanded = tk.BooleanVar(value=False)
-        cookie_frame = tk.Frame(cur_win); cookie_frame.pack(fill=tk.X, padx=20, pady=(8, 0))
-        
-        cookie_content = tk.Frame(cookie_frame)
+        # Cookie 状态显示（使用全局配置的 Cookie）
         saved_cookie = self._get_saved_cookie()
-        cookie_var = tk.StringVar(value=saved_cookie)
+        cookie_status_frame = tk.Frame(cur_win)
+        cookie_status_frame.pack(fill=tk.X, padx=20, pady=(8, 0))
         
-        def toggle_cookie():
-            if cookie_expanded.get():
-                cookie_content.pack_forget()
-                cookie_toggle_btn.config(text="▶ 登录态 Cookie（可选，用于获取完整内容）")
-                cookie_expanded.set(False)
-            else:
-                cookie_content.pack(fill=tk.X, pady=5)
-                cookie_toggle_btn.config(text="▼ 登录态 Cookie（可选，用于获取完整内容）")
-                cookie_expanded.set(True)
-        
-        initial_title = "▶ 登录态 Cookie（可选，用于获取完整内容）"
         if saved_cookie:
-            initial_title = "▶ 登录态 Cookie（✅ 已保存）"
-        
-        cookie_toggle_btn = tk.Button(cookie_frame, text=initial_title, 
-                                      command=toggle_cookie, relief=tk.FLAT, font=("微软雅黑", 9), fg="#666", cursor="hand2")
-        cookie_toggle_btn.pack(anchor=tk.W)
-        
-        help_text = tk.Label(cookie_content, 
-            text="获取方法：\n"
-                 "1. 用浏览器登录 store.steampowered.com\n"
-                 "2. 按 F12 打开开发者工具\n"
-                 "3. 切换到 Application（应用程序）标签页\n"
-                 "4. 左侧找到 Cookies → store.steampowered.com\n"
-                 "5. 找到 steamLoginSecure，复制其 Value 值", 
-            justify=tk.LEFT, font=("微软雅黑", 8), fg="#666")
-        help_text.pack(anchor=tk.W)
-        
-        cookie_entry = tk.Entry(cookie_content, textvariable=cookie_var, width=55, font=("微软雅黑", 8), show="•")
-        cookie_entry.pack(fill=tk.X, pady=2)
-        
-        cookie_btn_frame = tk.Frame(cookie_content)
-        cookie_btn_frame.pack(fill=tk.X, pady=(2, 0))
-        
-        def save_cookie_action():
-            val = cookie_var.get().strip()
-            if val:
-                self._save_cookie(val)
-                cookie_toggle_btn.config(text="▶ 登录态 Cookie（✅ 已保存）")
-                messagebox.showinfo("保存成功", "Cookie 已保存到本地配置文件。\n下次打开程序时将自动加载。")
-            else:
-                messagebox.showwarning("提示", "请先输入 Cookie 值。")
-        
-        def clear_cookie_action():
-            if messagebox.askyesno("确认清除", "确定要清除已保存的 Cookie 吗？"):
-                cookie_var.set("")
-                self._clear_saved_cookie()
-                cookie_toggle_btn.config(text="▶ 登录态 Cookie（可选，用于获取完整内容）")
-                messagebox.showinfo("已清除", "Cookie 已从本地配置中清除。")
-        
-        def show_cookie_action():
-            if cookie_entry.cget('show') == '•':
-                cookie_entry.config(show='')
-                show_btn.config(text="🙈 隐藏")
-            else:
-                cookie_entry.config(show='•')
-                show_btn.config(text="👁 显示")
-        
-        show_btn = tk.Button(cookie_btn_frame, text="👁 显示", command=show_cookie_action, 
-                             font=("微软雅黑", 8), width=8)
-        show_btn.pack(side=tk.LEFT, padx=(0, 5))
-        tk.Button(cookie_btn_frame, text="💾 保存", command=save_cookie_action, 
-                  font=("微软雅黑", 8), width=8).pack(side=tk.LEFT, padx=5)
-        tk.Button(cookie_btn_frame, text="🗑 清除", command=clear_cookie_action, 
-                  font=("微软雅黑", 8), width=8).pack(side=tk.LEFT, padx=5)
-        
-        tk.Label(cookie_content, text="⚠️ Cookie 包含敏感信息，请勿分享配置文件给他人", 
-                 font=("微软雅黑", 8), fg="orange").pack(anchor=tk.W, pady=(3, 0))
+            tk.Label(cookie_status_frame, text="🔐 已配置登录态 Cookie，可获取完整列表", 
+                     font=("微软雅黑", 9), fg="green").pack(anchor=tk.W)
+        else:
+            tk.Label(cookie_status_frame, text="⚠️ 未配置登录态 Cookie，可能无法获取完整内容列表", 
+                     font=("微软雅黑", 9), fg="orange").pack(anchor=tk.W)
+            tk.Label(cookie_status_frame, text="     → 可在主界面「🔑 管理 Cookie」中配置", 
+                     font=("微软雅黑", 8), fg="#888").pack(anchor=tk.W)
         
         status_var = tk.StringVar(value="尚未获取数据。")
         status_label = tk.Label(cur_win, textvariable=status_var, font=("微软雅黑", 9), fg="gray")
@@ -1783,7 +2160,8 @@ class SteamToolbox:
         
         login_hint = tk.Label(cur_win, text="⚠️ 未提供登录态 Cookie，可能无法获取完整内容列表", 
                               font=("微软雅黑", 8), fg="red")
-        login_hint.pack(padx=20, anchor=tk.W)
+        if not saved_cookie:
+            login_hint.pack(padx=20, anchor=tk.W)
         
         is_fetching = [False]
         
@@ -1805,7 +2183,7 @@ class SteamToolbox:
             cur_win.update()
             
             login_cookies = None
-            cookie_val = cookie_var.get().strip()
+            cookie_val = self._get_saved_cookie()
             if cookie_val:
                 login_cookies = f"steamLoginSecure={cookie_val}"
             
@@ -1937,22 +2315,15 @@ class SteamToolbox:
 
         def do_update():
             if not check_data(): return
-            statics = self._get_static_collections(data)
-            up_win = tk.Toplevel(); up_win.title("选择目标收藏夹"); up_win.attributes("-topmost", True)
-            lb = tk.Listbox(up_win, width=40, height=10); lb.pack(padx=20, pady=5)
-            for s in statics: lb.insert(tk.END, s['name'])
-            def confirm_up():
-                idx = lb.curselection()
-                if not idx: return
-                target = statics[idx[0]]
-                a, r, t, updated = self._perform_incremental_update(data, target['entry_ref'], list(fetched_ids), target['name'])
-                if not updated:
-                    messagebox.showinfo("已是最新", f"该列表已是最新，无需更新。\n\n• 当前总计: {t} 个游戏\n• 来源比收藏夹少: {r} 个")
-                else:
-                    self.save_json(data, backup_description=f"更新收藏夹: {target['name']}")
-                    messagebox.showinfo("更新完成", f"列表更新完成。\n\n• 比旧版多的: {a} 个\n• 比旧版少的: {r} 个\n• 更新后总计: {t} 个" + self.disclaimer)
-                up_win.destroy(); cur_win.destroy()
-            tk.Button(up_win, text="确认更新", command=confirm_up).pack(pady=10)
+            all_cols = self._get_all_collections_with_refs(data)
+            if not all_cols:
+                messagebox.showwarning("提示", "未找到任何收藏夹。")
+                return
+            sources = {fetched_name.get() or "Steam 列表": {"name": fetched_name.get() or "Steam 列表", "ids": list(fetched_ids)}}
+            def on_done():
+                self.save_json(data, backup_description=f"从 Steam 列表更新收藏夹")
+                cur_win.destroy()
+            self._show_batch_update_mapping(data, all_cols, sources, on_done, parent_to_close=cur_win)
 
         tk.Button(btn_frame, text="📁 建立为新收藏夹", command=do_create, width=15).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="📥 导出为 TXT 文件", command=do_export, width=18).pack(side=tk.LEFT, padx=5)
@@ -2555,179 +2926,26 @@ class SteamToolbox:
             fetch_and_execute('export', export_action)
         
         def do_update():
-            statics = self._get_static_collections(data)
-            if not statics:
-                messagebox.showwarning("提示", "未找到可更新的静态收藏夹。")
+            all_cols = self._get_all_collections_with_refs(data)
+            if not all_cols:
+                messagebox.showwarning("提示", "未找到任何收藏夹。")
                 return
             
             def update_action():
-                # 创建更新窗口
-                up_win = tk.Toplevel()
-                up_win.title("批量更新收藏夹")
-                up_win.attributes("-topmost", True)
+                sources = {}
+                for key, d in fetched_data.items():
+                    sources[key] = {"name": d['name'], "ids": d['ids']}
                 
-                tk.Label(up_win, text="请为每个获取到的来源选择要更新的目标收藏夹：", 
-                         font=("微软雅黑", 10, "bold")).pack(pady=(15, 10))
+                def on_done():
+                    self.save_json(data, backup_description="从个人推荐分类更新收藏夹")
+                    rec_win.destroy()
                 
-                # 创建映射选择区域（增加左右边距）
-                mapping_frame = tk.Frame(up_win)
-                mapping_frame.pack(fill=tk.BOTH, expand=True, padx=30, pady=(0, 10))
-                
-                # 加载上次保存的映射选择
-                config = self._load_config()
-                saved_mappings = config.get("recommend_update_mappings", {})
-                
-                # 为每个数据源创建下拉选择
-                combo_vars = {}
-                static_names = ["（跳过）"] + [s['name'] for s in statics]
-                
-                # 计算所需的最大宽度
-                max_source_len = max(len(d['name']) for d in fetched_data.values()) if fetched_data else 20
-                max_target_len = max(len(n) for n in static_names) if static_names else 20
-                
-                # 如果条目数量少于8个，不需要滚动，直接显示
-                if len(fetched_data) <= 8:
-                    for key, d in fetched_data.items():
-                        row_frame = tk.Frame(mapping_frame)
-                        row_frame.pack(fill=tk.X, pady=5)
-                        
-                        tk.Label(row_frame, text=f"📦 {d['name']} ({len(d['ids'])} 个游戏)", 
-                                 font=("微软雅黑", 9), anchor=tk.W).pack(side=tk.LEFT)
-                        tk.Label(row_frame, text="→", font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=10)
-                        
-                        combo = ttk.Combobox(row_frame, values=static_names, width=max(30, max_target_len + 5), state="readonly")
-                        
-                        # 尝试恢复上次的选择
-                        last_selection = saved_mappings.get(key, "")
-                        if last_selection and last_selection in static_names:
-                            combo.set(last_selection)
-                        else:
-                            combo.set("（跳过）")
-                        
-                        combo.pack(side=tk.LEFT)
-                        combo_vars[key] = combo
-                else:
-                    # 条目较多时使用 Canvas 支持滚动
-                    canvas = tk.Canvas(mapping_frame, height=300)
-                    scrollbar = ttk.Scrollbar(mapping_frame, orient="vertical", command=canvas.yview)
-                    scrollable_frame = tk.Frame(canvas)
-                    
-                    scrollable_frame.bind(
-                        "<Configure>",
-                        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-                    )
-                    
-                    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-                    canvas.configure(yscrollcommand=scrollbar.set)
-                    
-                    scrollbar.pack(side="right", fill="y")
-                    canvas.pack(side="left", fill="both", expand=True)
-                    
-                    # 鼠标滚轮支持
-                    def _on_mousewheel(event):
-                        # 跨平台兼容：Windows 使用 event.delta，Linux/macOS 使用 event.num
-                        if event.delta:
-                            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-                        elif event.num == 4:
-                            canvas.yview_scroll(-1, "units")
-                        elif event.num == 5:
-                            canvas.yview_scroll(1, "units")
-                    
-                    # 绑定滚轮事件到窗口和子组件
-                    def _bind_mousewheel(widget):
-                        widget.bind("<MouseWheel>", _on_mousewheel)  # Windows/macOS
-                        widget.bind("<Button-4>", _on_mousewheel)    # Linux scroll up
-                        widget.bind("<Button-5>", _on_mousewheel)    # Linux scroll down
-                    
-                    _bind_mousewheel(canvas)
-                    _bind_mousewheel(scrollable_frame)
-                    _bind_mousewheel(up_win)
-                    
-                    for key, d in fetched_data.items():
-                        row_frame = tk.Frame(scrollable_frame)
-                        row_frame.pack(fill=tk.X, pady=5)
-                        
-                        # 绑定滚轮事件到行框架
-                        _bind_mousewheel(row_frame)
-                        
-                        tk.Label(row_frame, text=f"📦 {d['name']} ({len(d['ids'])} 个游戏)", 
-                                 font=("微软雅黑", 9), anchor=tk.W).pack(side=tk.LEFT)
-                        tk.Label(row_frame, text="→", font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=10)
-                        
-                        combo = ttk.Combobox(row_frame, values=static_names, width=max(30, max_target_len + 5), state="readonly")
-                        
-                        # 尝试恢复上次的选择
-                        last_selection = saved_mappings.get(key, "")
-                        if last_selection and last_selection in static_names:
-                            combo.set(last_selection)
-                        else:
-                            combo.set("（跳过）")
-                        
-                        combo.pack(side=tk.LEFT)
-                        combo_vars[key] = combo
-                    
-                    # 更新 Canvas 宽度以适应内容
-                    scrollable_frame.update_idletasks()
-                    canvas.config(width=scrollable_frame.winfo_reqwidth())
-                
-                def confirm_update():
-                    update_count = 0
-                    skipped_count = 0
-                    results = []
-                    
-                    # 保存当前的映射选择以便下次使用
-                    config = self._load_config()
-                    current_mappings = {}
-                    for key, combo in combo_vars.items():
-                        selected_name = combo.get()
-                        if selected_name != "（跳过）":
-                            current_mappings[key] = selected_name
-                    config["recommend_update_mappings"] = current_mappings
-                    self._save_config(config)
-                    
-                    for key, combo in combo_vars.items():
-                        selected_name = combo.get()
-                        if selected_name == "（跳过）":
-                            continue
-                        
-                        # 找到对应的收藏夹
-                        target = None
-                        for s in statics:
-                            if s['name'] == selected_name:
-                                target = s
-                                break
-                        
-                        if target:
-                            source_data = fetched_data[key]
-                            a, r, t, updated = self._perform_incremental_update(
-                                data, target['entry_ref'], source_data['ids'], target['name']
-                            )
-                            if updated:
-                                results.append(f"✅ {source_data['name']} → {target['name']}\n   新增: {a}, 移除: {r}, 总计: {t}")
-                                update_count += 1
-                            else:
-                                results.append(f"⏭️ {source_data['name']} → {target['name']}\n   已是最新，跳过")
-                                skipped_count += 1
-                    
-                    if update_count > 0:
-                        self.save_json(data, backup_description="从个人推荐分类更新收藏夹")
-                        result_text = "\n".join(results)
-                        messagebox.showinfo("更新完成", f"已更新 {update_count} 个收藏夹，跳过 {skipped_count} 个：\n\n{result_text}" + self.disclaimer)
-                        up_win.destroy()
-                        rec_win.destroy()
-                    elif skipped_count > 0:
-                        result_text = "\n".join(results)
-                        messagebox.showinfo("全部已是最新", f"所有选中的收藏夹都已是最新，无需更新。\n\n{result_text}")
-                        up_win.destroy()
-                    else:
-                        messagebox.showwarning("提示", "未选择任何目标收藏夹。")
-                
-                btn_row = tk.Frame(up_win)
-                btn_row.pack(pady=15)
-                tk.Button(btn_row, text="✅ 确认更新", command=confirm_update, width=15).pack(side=tk.LEFT, padx=10)
-                tk.Button(btn_row, text="取消", command=up_win.destroy, width=10).pack(side=tk.LEFT, padx=10)
+                self._show_batch_update_mapping(data, all_cols, sources, on_done,
+                                                 parent_to_close=rec_win,
+                                                 saved_mappings_key="recommend_update_mappings")
             
             fetch_and_execute('update', update_action)
+
         
         # 按钮排列顺序遵守规范：[导入]、[导出]、[更新]
         btn1 = tk.Button(btn_frame, text="📁 建立为新收藏夹", command=do_create, width=15)
@@ -2829,22 +3047,15 @@ class SteamToolbox:
 
         def do_update():
             if not merged_ids: messagebox.showwarning("错误", "请先选择文件并提取 AppID。"); return
-            statics = self._get_static_collections(data)
-            up_win = tk.Toplevel(); up_win.title("选择目标收藏夹"); up_win.attributes("-topmost", True)
-            lb = tk.Listbox(up_win, width=40, height=10); lb.pack(padx=20, pady=5)
-            for s in statics: lb.insert(tk.END, s['name'])
-            def confirm_up():
-                idx = lb.curselection()
-                if not idx: return
-                target = statics[idx[0]]
-                a, r, t, updated = self._perform_incremental_update(data, target['entry_ref'], list(merged_ids), target['name'])
-                if not updated:
-                    messagebox.showinfo("已是最新", f"该列表已是最新，无需更新。\n\n• 当前总计: {t} 个游戏\n• 来源比收藏夹少: {r} 个")
-                else:
-                    self.save_json(data, backup_description=f"从 SteamDB 更新收藏夹: {target['name']}")
-                    messagebox.showinfo("更新完成", f"SteamDB 更新完成。\n\n• 比旧版多的: {a} 个\n• 比旧版少的: {r} 个\n• 更新后总计: {t} 个" + self.disclaimer)
-                up_win.destroy(); db_win.destroy()
-            tk.Button(up_win, text="确认更新", command=confirm_up).pack(pady=10)
+            all_cols = self._get_all_collections_with_refs(data)
+            if not all_cols:
+                messagebox.showwarning("提示", "未找到任何收藏夹。")
+                return
+            sources = {"SteamDB 列表": {"name": "SteamDB 列表", "ids": list(merged_ids)}}
+            def on_done():
+                self.save_json(data, backup_description="从 SteamDB 更新收藏夹")
+                db_win.destroy()
+            self._show_batch_update_mapping(data, all_cols, sources, on_done, parent_to_close=db_win)
 
         btn_frame = tk.Frame(db_win); btn_frame.pack(pady=15)
         tk.Button(btn_frame, text="📁 建立为新收藏夹", command=do_create, width=15).pack(side=tk.LEFT, padx=5)
@@ -3454,6 +3665,44 @@ class SteamToolbox:
         root.title("Steam 库管理助手")
         root.resizable(False, False)
         
+        # ====== 待保存更改追踪 ======
+        self._pending_data = None       # 待保存的 data 对象
+        self._has_pending_changes = False
+        self._original_col_ids = set()  # 导入前已有的收藏夹 ID，用于标红新增项
+        
+        def mark_dirty(data):
+            """标记有未保存的更改"""
+            self._pending_data = data
+            self._has_pending_changes = True
+            save_btn.config(state=tk.NORMAL)
+            save_indicator.config(text="⚠️ 有未保存的更改", fg="orange")
+        
+        def commit_save():
+            """储存更改：备份当前分类，写入新分类"""
+            if not self._has_pending_changes or self._pending_data is None:
+                messagebox.showinfo("提示", "没有需要保存的更改。")
+                return
+            result = self.save_json(self._pending_data, backup_description="储存收藏夹更改")
+            if result:
+                self._has_pending_changes = False
+                self._pending_data = None
+                self._original_col_ids.clear()
+                save_btn.config(state=tk.DISABLED)
+                save_indicator.config(text="✅ 所有更改已保存", fg="green")
+                refresh_categories()
+        
+        def on_close():
+            """关闭窗口时检查未保存更改"""
+            if self._has_pending_changes:
+                ans = messagebox.askyesnocancel("未保存的更改", "您有未保存的更改。\n\n是否在退出前保存？")
+                if ans is None:  # 取消
+                    return
+                if ans:  # 是：保存后退出
+                    commit_save()
+            root.destroy()
+        
+        root.protocol("WM_DELETE_WINDOW", on_close)
+        
         # ====== 当前账号信息（高亮显示） ======
         account_frame = tk.Frame(root, bg="#4a90d9", pady=10)
         account_frame.pack(fill=tk.X)
@@ -3463,20 +3712,235 @@ class SteamToolbox:
         
         if len(self.accounts) > 1:
             def switch_account():
+                if self._has_pending_changes:
+                    ans = messagebox.askyesnocancel("未保存的更改", "您有未保存的更改。\n\n是否在切换账号前保存？")
+                    if ans is None:
+                        return
+                    if ans:
+                        commit_save()
                 root.destroy()
                 self._show_account_selector()
             tk.Button(account_frame, text="🔄 切换账号", command=switch_account, font=("微软雅黑", 9)).pack(side=tk.RIGHT, padx=15)
         
-        # ====== 主内容区（左侧控制面板 + 右侧分类列表） ======
+        # ====== 主内容区（左侧收藏夹列表 + 右侧功能控制区） ======
         main_container = tk.Frame(root)
         main_container.pack(fill=tk.BOTH, expand=True)
         
-        # 左侧：功能控制区
-        left_panel = tk.Frame(main_container)
-        left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # ====== 左侧：收藏夹列表面板（仿 Steam 侧边栏） ======
+        left_panel = tk.Frame(main_container, bg="#f0f0f0", padx=10, pady=10)
+        left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0), pady=10)
+        
+        # 标题行：📂 当前收藏夹 + 💾 备份管理按钮 + 🔄 刷新按钮
+        title_row = tk.Frame(left_panel, bg="#f0f0f0")
+        title_row.pack(fill=tk.X)
+        tk.Label(title_row, text="📂 当前收藏夹", font=("微软雅黑", 11, "bold"), bg="#f0f0f0").pack(side=tk.LEFT)
+        ttk.Button(title_row, text="💾 备份", width=7, command=self.open_backup_manager_ui).pack(side=tk.RIGHT, padx=(5, 0))
+        ttk.Button(title_row, text="🔄", width=3, command=lambda: refresh_categories()).pack(side=tk.RIGHT, padx=(5, 0))
+        
+        tk.Label(left_panel, text="（按字母顺序排列）", font=("微软雅黑", 9), fg="#666666", bg="#f0f0f0").pack(anchor=tk.W)
+        
+        # 全选控制行
+        select_ctrl_row = tk.Frame(left_panel, bg="#f0f0f0")
+        select_ctrl_row.pack(fill=tk.X, pady=(5, 0))
+        select_all_var = tk.BooleanVar(value=False)
+        
+        def toggle_select_all():
+            val = select_all_var.get()
+            for var in checkbox_vars:
+                var.set(val)
+        
+        tk.Checkbutton(select_ctrl_row, text="全选", variable=select_all_var, command=toggle_select_all,
+                        bg="#f0f0f0", font=("微软雅黑", 9)).pack(side=tk.LEFT)
+        
+        # 选中计数
+        selection_count_label = tk.Label(select_ctrl_row, text="", font=("微软雅黑", 8), fg="#888888", bg="#f0f0f0")
+        selection_count_label.pack(side=tk.RIGHT)
+        
+        # 分类列表框架
+        list_container = tk.Frame(left_panel, bg="#f0f0f0")
+        list_container.pack(fill=tk.BOTH, expand=True, pady=(5, 5))
+        
+        # 使用 Canvas + Frame 实现滚动
+        canvas = tk.Canvas(list_container, bg="#ffffff", width=220, height=380, highlightthickness=1, highlightbackground="#cccccc")
+        scrollbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg="#ffffff")
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # 让 scrollable_frame 宽度始终跟随 canvas 宽度，确保 fill=tk.X 和 side=tk.RIGHT 生效
+        def _on_canvas_configure(event):
+            canvas.itemconfig(canvas_window, width=event.width)
+        canvas.bind("<Configure>", _on_canvas_configure)
+        
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # 鼠标滚轮绑定（兼容 macOS 触控板）
+        def _on_mousewheel(event):
+            if platform.system() == "Darwin":
+                canvas.yview_scroll(int(-1 * event.delta), "units")
+            else:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        # Linux 滚轮支持
+        canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-3, "units"))
+        canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(3, "units"))
+        
+        # 收藏夹数据和复选框变量
+        checkbox_vars = []
+        current_collections = []
+        
+        def update_selection_count(*args):
+            count = sum(1 for v in checkbox_vars if v.get())
+            total = len(checkbox_vars)
+            if count > 0:
+                selection_count_label.config(text=f"已选 {count}/{total}")
+            else:
+                selection_count_label.config(text="")
+            # 同步全选按钮状态
+            if total > 0 and count == total:
+                select_all_var.set(True)
+            else:
+                select_all_var.set(False)
+        
+        # 刷新分类列表的函数
+        def refresh_categories():
+            nonlocal checkbox_vars, current_collections
+            # 清空现有内容
+            for widget in scrollable_frame.winfo_children():
+                widget.destroy()
+            checkbox_vars.clear()
+            current_collections.clear()
+            select_all_var.set(False)
+            selection_count_label.config(text="")
+            
+            # 有未保存的更改时，从 _pending_data 读取；否则从文件读取
+            if self._has_pending_changes and self._pending_data is not None:
+                data = self._pending_data
+            else:
+                data = self.load_json()
+            if data is None:
+                tk.Label(scrollable_frame, text="❌ 无法读取配置文件", font=("微软雅黑", 9), fg="red", bg="#ffffff", padx=10, pady=5).pack(anchor=tk.W)
+                return
+            
+            collections = self._get_all_collections_ordered(data)
+            current_collections.extend(collections)
+            
+            if not collections:
+                empty_label = tk.Label(scrollable_frame, text="所有分类为空", font=("微软雅黑", 10), fg="#999999", bg="#ffffff", padx=10, pady=20)
+                empty_label.pack(anchor=tk.CENTER, expand=True)
+            else:
+                for i, col in enumerate(collections):
+                    # 创建每个分类的显示项
+                    item_frame = tk.Frame(scrollable_frame, bg="#ffffff")
+                    item_frame.pack(fill=tk.X, padx=2, pady=1)
+                    
+                    # 复选框
+                    var = tk.BooleanVar(value=False)
+                    var.trace_add("write", update_selection_count)
+                    checkbox_vars.append(var)
+                    
+                    cb = tk.Checkbutton(item_frame, variable=var, bg="#ffffff", activebackground="#ffffff")
+                    cb.pack(side=tk.LEFT)
+                    
+                    # 分类类型图标
+                    icon = "📁" if not col['is_dynamic'] else "🔍"
+                    
+                    # 判定颜色：
+                    #   红色 = 有未保存更改 且 该收藏夹是新增的（不在原始 ID 集合中）
+                    #   蓝色 = 已保存，但名称尾部仍带有云同步后缀
+                    #   默认黑色
+                    col_id = col.get("id", "")
+                    col_name = col.get("name", "")
+                    is_new_unsaved = (self._has_pending_changes
+                                      and self._original_col_ids
+                                      and col_id not in self._original_col_ids)
+                    has_sync_suffix = col_name.endswith(self.induce_suffix)
+                    
+                    if is_new_unsaved:
+                        name_fg = "#cc0000"   # 红色：未保存的新增
+                    elif has_sync_suffix and not self._has_pending_changes:
+                        name_fg = "#1a6dcc"   # 蓝色：已保存但仍带后缀
+                    else:
+                        name_fg = "#000000"   # 默认黑色
+                    
+                    # 分类名称
+                    name_text = f"{icon} {col_name}"
+                    if len(name_text) > 20:
+                        name_text = name_text[:18] + "..."
+                    
+                    name_label = tk.Label(item_frame, text=name_text, font=("微软雅黑", 9),
+                                          bg="#ffffff", fg=name_fg, anchor=tk.W)
+                    name_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                    # 点击名称也可以切换选中状态
+                    name_label.bind("<Button-1>", lambda e, v=var: v.set(not v.get()))
+                    
+                    # 蓝色项添加提示：鼠标悬停时显示 tooltip
+                    if has_sync_suffix and not self._has_pending_changes:
+                        tip_text = "请在 Steam 内删去名称后缀以触发云同步"
+                        name_label.bind("<Enter>", lambda e, lbl=name_label, t=tip_text: lbl.config(cursor="question_arrow"))
+                        name_label.bind("<Leave>", lambda e, lbl=name_label: lbl.config(cursor=""))
+                    
+                    # 游戏数量（仅静态收藏夹显示数量，动态收藏夹显示额外添加数）
+                    if not col['is_dynamic']:
+                        count_label = tk.Label(item_frame, text=f"({len(col['added'])})", font=("微软雅黑", 8), fg="#888888", bg="#ffffff")
+                        count_label.pack(side=tk.RIGHT)
+                    elif col.get('added'):
+                        count_label = tk.Label(item_frame, text=f"(+{len(col['added'])})", font=("微软雅黑", 8), fg="#aa88cc", bg="#ffffff")
+                        count_label.pack(side=tk.RIGHT)
+            
+            # 蓝色后缀提示（保存后、有带后缀的收藏夹时显示）
+            if not self._has_pending_changes:
+                has_any_suffix = any(c.get("name", "").endswith(self.induce_suffix) for c in collections)
+                if has_any_suffix:
+                    save_indicator.config(text="🔵 蓝色项：请在 Steam 内删去后缀", fg="#1a6dcc")
+            
+            # 更新滚动区域
+            scrollable_frame.update_idletasks()
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        
+        # 获取当前选中的收藏夹
+        def get_selected_collections():
+            selected = []
+            for i, var in enumerate(checkbox_vars):
+                if var.get() and i < len(current_collections):
+                    selected.append(current_collections[i])
+            return selected
+        
+        # 暴露给右侧按钮方法使用
+        self._ui_get_selected = get_selected_collections
+        self._ui_mark_dirty = mark_dirty
+        self._ui_refresh = refresh_categories
+        
+        # ====== 左侧底部：储存更改按钮 ======
+        left_btn_frame = tk.Frame(left_panel, bg="#f0f0f0")
+        left_btn_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        # 储存更改按钮 + 状态指示
+        save_row = tk.Frame(left_btn_frame, bg="#f0f0f0")
+        save_row.pack(fill=tk.X, pady=(2, 0))
+        save_btn = ttk.Button(save_row, text="💾 储存更改", width=23, command=commit_save, state=tk.DISABLED)
+        save_btn.pack(fill=tk.X)
+        
+        save_indicator = tk.Label(left_panel, text="", font=("微软雅黑", 8), bg="#f0f0f0")
+        save_indicator.pack(anchor=tk.W)
+        
+        # 初始加载分类列表
+        refresh_categories()
+        
+        # ====== 右侧：功能控制区 ======
+        right_panel = tk.Frame(main_container)
+        right_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
         # ====== 操作守则 ======
-        instruction_frame = tk.Frame(left_panel, pady=15, padx=35)
+        instruction_frame = tk.Frame(right_panel, pady=15, padx=35)
         instruction_frame.pack(fill=tk.X)
         
         t_top = tk.Text(instruction_frame, font=("微软雅黑", 10), height=8, bg=root.cget("bg"), relief=tk.FLAT, wrap=tk.WORD)
@@ -3486,9 +3950,9 @@ class SteamToolbox:
         t_top.insert(tk.END, "✅ 已自动定位到账号的收藏夹配置文件\n\n", "green")
         t_top.insert(tk.END, "操作守则：\n一、导入前请")
         t_top.insert(tk.END, "关闭", "red")
-        t_top.insert(tk.END, " Steam；\n二、修改会")
-        t_top.insert(tk.END, "直接保存到原文件", "red")
-        t_top.insert(tk.END, "，程序会自动创建备份；\n三、为了上传云端，您必须")
+        t_top.insert(tk.END, " Steam；\n二、导入或更新后需点击左侧")
+        t_top.insert(tk.END, "「💾 储存更改」", "red")
+        t_top.insert(tk.END, "才会写入文件，程序会自动创建备份；\n三、为了上传云端，您必须")
         t_top.insert(tk.END, "在 Steam 内手动修改", "red")
         t_top.insert(tk.END, "新收藏，如删去自动添加的名称后缀等。")
         t_top.config(state=tk.DISABLED)
@@ -3498,23 +3962,25 @@ class SteamToolbox:
         style.configure("TButton", font=("微软雅黑", 11), padding=8)
         
         # ====== 功能按钮 ======
-        row1_frame = tk.Frame(left_panel, padx=35)
+        row1_frame = tk.Frame(right_panel, padx=35)
         row1_frame.pack(fill=tk.X, pady=(5, 0))
         ttk.Button(row1_frame, text="📁 批量导入", width=15, command=self.import_from_txt).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(row1_frame, text="📤 批量导出", width=15, command=self.export_static_collection).pack(side=tk.LEFT, padx=10)
         ttk.Button(row1_frame, text="🔄 批量更新", width=15, command=self.update_static_collection).pack(side=tk.LEFT, padx=10)
         
-        d_row1 = tk.Text(left_panel, font=("微软雅黑", 9), height=5, bg=root.cget("bg"), relief=tk.FLAT, padx=35)
+        d_row1 = tk.Text(right_panel, font=("微软雅黑", 9), height=5, bg=root.cget("bg"), relief=tk.FLAT, padx=35)
         d_row1.tag_config("red", foreground="red")
-        d_row1.insert(tk.END, "• 导入：文件名会成为收藏夹名称，内容为")
-        d_row1.insert(tk.END, "每行一个 AppID", "red")
-        d_row1.insert(tk.END, "。\n• 导出时收藏夹名称会成为文件名，特殊符号会被替换为下划线。\n")
-        d_row1.insert(tk.END, "• 更新功能会将新出现的 AppID 追加到目标收藏夹，同时创建两个辅助收藏夹分别记录比旧版多的和比旧版少的部分。")
+        d_row1.insert(tk.END, "• 导入：支持 ")
+        d_row1.insert(tk.END, "TXT（AppID 列表）", "red")
+        d_row1.insert(tk.END, " 或 ")
+        d_row1.insert(tk.END, "JSON（结构化收藏夹）", "red")
+        d_row1.insert(tk.END, "。\n• 导出：需先在左侧勾选收藏夹，支持合并 TXT / 多个 TXT / JSON 三种格式。\n")
+        d_row1.insert(tk.END, "• 更新：支持增量更新（追加 + 差异记录）或替换更新（直接覆盖）两种模式。")
         d_row1.config(state=tk.DISABLED)
         d_row1.pack(fill=tk.X, pady=5)
 
-        ttk.Button(left_panel, text="👥 批量同步 Steam 用户游戏库", width=53, command=self.open_friend_sync_ui).pack(pady=(5,0))
-        d4 = tk.Text(left_panel, font=("微软雅黑", 9), height=2, bg=root.cget("bg"), relief=tk.FLAT, padx=35)
+        ttk.Button(right_panel, text="👥 批量同步 Steam 用户游戏库", width=53, command=self.open_friend_sync_ui).pack(pady=(5,0))
+        d4 = tk.Text(right_panel, font=("微软雅黑", 9), height=2, bg=root.cget("bg"), relief=tk.FLAT, padx=35)
         d4.tag_config("red", foreground="red")
         d4.insert(tk.END, "• 对方必须")
         d4.insert(tk.END, "公开", "red")
@@ -3523,14 +3989,14 @@ class SteamToolbox:
         d4.pack(fill=tk.X, pady=5)
 
         # ====== 两个并列的来源按钮（居中） ======
-        source_row = tk.Frame(left_panel)
+        source_row = tk.Frame(right_panel)
         source_row.pack(fill=tk.X, pady=(5, 0))
         source_inner = tk.Frame(source_row)
         source_inner.pack(anchor=tk.CENTER)
         ttk.Button(source_inner, text="⭐ 从推荐来源获取", width=25, command=self.personal_recommend_ui).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(source_inner, text="🌐 从其他来源获取", width=25, command=self.open_source_selection).pack(side=tk.LEFT)
         
-        d5 = tk.Text(left_panel, font=("微软雅黑", 9), height=4, bg=root.cget("bg"), relief=tk.FLAT, padx=35)
+        d5 = tk.Text(right_panel, font=("微软雅黑", 9), height=4, bg=root.cget("bg"), relief=tk.FLAT, padx=35)
         d5.tag_config("purple", foreground="#7c3aed")
         d5.tag_config("blue", foreground="#5b9bd5")
         d5.insert(tk.END, "• 推荐来源：")
@@ -3547,116 +4013,25 @@ class SteamToolbox:
         d5.config(state=tk.DISABLED)
         d5.pack(fill=tk.X, pady=(5, 10))
         
-        # ====== 备份管理按钮 ======
-        ttk.Button(left_panel, text="💾 管理收藏夹备份", width=53, command=self.open_backup_manager_ui).pack(pady=(5, 0))
-        d6 = tk.Text(left_panel, font=("微软雅黑", 9), height=2, bg=root.cget("bg"), relief=tk.FLAT, padx=35)
-        d6.tag_config("green", foreground="green")
-        d6.insert(tk.END, "• 查看、恢复、删除备份，以及对比")
-        d6.insert(tk.END, "备份与当前文件的详细差异", "green")
-        d6.insert(tk.END, "。")
-        d6.config(state=tk.DISABLED)
-        d6.pack(fill=tk.X, pady=(5, 0))
+        # ====== Cookie 和 IGDB API 并排 ======
+        config_row = tk.Frame(right_panel)
+        config_row.pack(fill=tk.X, pady=(5, 0))
+        config_inner = tk.Frame(config_row)
+        config_inner.pack(anchor=tk.CENTER)
+        ttk.Button(config_inner, text="🔑 管理 Cookie", width=25, command=self.open_cookie_manager_ui).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(config_inner, text="🎮 管理 IGDB API", width=25, command=self.open_igdb_credentials_ui).pack(side=tk.LEFT)
         
-        # ====== Cookie 管理按钮 ======
-        ttk.Button(left_panel, text="🔑 管理登录态 Cookie", width=53, command=self.open_cookie_manager_ui).pack(pady=(10, 0))
-        d7 = tk.Text(left_panel, font=("微软雅黑", 9), height=2, bg=root.cget("bg"), relief=tk.FLAT, padx=35)
-        d7.tag_config("orange", foreground="orange")
-        d7.insert(tk.END, "• 配置 Steam 登录态 Cookie，用于获取")
-        d7.insert(tk.END, "完整的鉴赏家列表", "orange")
-        d7.insert(tk.END, "（含各种内容）。")
-        d7.config(state=tk.DISABLED)
-        d7.pack(fill=tk.X, pady=(5, 0))
-        
-        # ====== IGDB API 管理按钮 ======
-        ttk.Button(left_panel, text="🎮 管理 IGDB API 凭证", width=53, command=self.open_igdb_credentials_ui).pack(pady=(10, 0))
-        d8 = tk.Text(left_panel, font=("微软雅黑", 9), height=2, bg=root.cget("bg"), relief=tk.FLAT, padx=35)
-        d8.tag_config("purple", foreground="#7c3aed")
-        d8.insert(tk.END, "• 配置 IGDB API 凭证，用于按")
-        d8.insert(tk.END, "游戏类型分类", "purple")
-        d8.insert(tk.END, "获取游戏列表。")
-        d8.config(state=tk.DISABLED)
-        d8.pack(fill=tk.X, pady=(5, 20))
-        
-        # ====== 右侧：分类列表面板 ======
-        right_panel = tk.Frame(main_container, bg="#f0f0f0", padx=10, pady=10)
-        right_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=10)
-        
-        tk.Label(right_panel, text="📂 当前收藏夹", font=("微软雅黑", 11, "bold"), bg="#f0f0f0").pack(anchor=tk.W)
-        tk.Label(right_panel, text="（按 Steam 内顺序）", font=("微软雅黑", 9), fg="#666666", bg="#f0f0f0").pack(anchor=tk.W)
-        
-        # 分类列表框架
-        list_container = tk.Frame(right_panel, bg="#f0f0f0")
-        list_container.pack(fill=tk.BOTH, expand=True, pady=(10, 5))
-        
-        # 使用 Canvas + Frame 实现滚动
-        canvas = tk.Canvas(list_container, bg="#ffffff", width=200, height=350, highlightthickness=1, highlightbackground="#cccccc")
-        scrollbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas, bg="#ffffff")
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # 鼠标滚轮绑定
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        
-        # 刷新分类列表的函数
-        def refresh_categories():
-            # 清空现有内容
-            for widget in scrollable_frame.winfo_children():
-                widget.destroy()
-            
-            # 读取 JSON 获取分类
-            data = self.load_json()
-            if data is None:
-                tk.Label(scrollable_frame, text="❌ 无法读取配置文件", font=("微软雅黑", 9), fg="red", bg="#ffffff", padx=10, pady=5).pack(anchor=tk.W)
-                return
-            
-            collections = self._get_all_collections_ordered(data)
-            
-            if not collections:
-                empty_label = tk.Label(scrollable_frame, text="所有分类为空", font=("微软雅黑", 10), fg="#999999", bg="#ffffff", padx=10, pady=20)
-                empty_label.pack(anchor=tk.CENTER, expand=True)
-            else:
-                for i, col in enumerate(collections):
-                    # 创建每个分类的显示项
-                    item_frame = tk.Frame(scrollable_frame, bg="#ffffff")
-                    item_frame.pack(fill=tk.X, padx=5, pady=2)
-                    
-                    # 分类类型图标
-                    icon = "📁" if not col['is_dynamic'] else "🔍"
-                    
-                    # 分类名称
-                    name_text = f"{icon} {col['name']}"
-                    if len(name_text) > 22:
-                        name_text = name_text[:20] + "..."
-                    
-                    name_label = tk.Label(item_frame, text=name_text, font=("微软雅黑", 9), bg="#ffffff", anchor=tk.W)
-                    name_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-                    
-                    # 游戏数量（仅静态收藏夹显示）
-                    if not col['is_dynamic']:
-                        count_label = tk.Label(item_frame, text=f"({len(col['added'])})", font=("微软雅黑", 8), fg="#888888", bg="#ffffff")
-                        count_label.pack(side=tk.RIGHT)
-            
-            # 更新滚动区域
-            scrollable_frame.update_idletasks()
-            canvas.configure(scrollregion=canvas.bbox("all"))
-        
-        # 刷新按钮
-        ttk.Button(right_panel, text="🔄 刷新列表", width=15, command=refresh_categories).pack(pady=(5, 0))
-        
-        # 初始加载分类列表
-        refresh_categories()
+        d_config = tk.Text(right_panel, font=("微软雅黑", 9), height=3, bg=root.cget("bg"), relief=tk.FLAT, padx=35)
+        d_config.tag_config("orange", foreground="orange")
+        d_config.tag_config("purple", foreground="#7c3aed")
+        d_config.insert(tk.END, "• Cookie：获取")
+        d_config.insert(tk.END, "完整的鉴赏家列表", "orange")
+        d_config.insert(tk.END, "（含各种内容）。\n")
+        d_config.insert(tk.END, "• IGDB API：按")
+        d_config.insert(tk.END, "游戏类型分类", "purple")
+        d_config.insert(tk.END, "获取游戏列表。")
+        d_config.config(state=tk.DISABLED)
+        d_config.pack(fill=tk.X, pady=(5, 20))
         
         root.update_idletasks()
         cw, ch = root.winfo_reqwidth(), root.winfo_reqheight()
