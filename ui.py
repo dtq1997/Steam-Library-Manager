@@ -1402,7 +1402,7 @@ class SteamToolbox:
                     for key, d in fetched_data.items():
                         new_name = name_entries[key].get().strip()
                         if new_name:
-                            self.protected_add_static_collection(data, new_name, d['ids'])
+                            self.core.add_static_collection(data, new_name, d['ids'])
                     self.core.save_json(data, backup_description="从个人推荐分类创建收藏夹")
                     messagebox.showinfo("成功", f"已创建 {len(fetched_data)} 个收藏夹。" + self.disclaimer)
                     name_win.destroy()
@@ -1540,7 +1540,7 @@ class SteamToolbox:
             if not merged_ids: messagebox.showwarning("错误", "请先选择文件并提取 AppID。"); return
             name = simpledialog.askstring("新建收藏夹", "请输入收藏夹名称：", initialvalue=name_var.get())
             if name:
-                self.protected_add_static_collection(data, name, list(merged_ids))
+                self.core.add_static_collection(data, name, list(merged_ids))
                 self.core.save_json(data, backup_description=f"从 SteamDB 创建收藏夹: {name}")
                 detail = '\n'.join(merge_stats)
                 messagebox.showinfo("录入成功",

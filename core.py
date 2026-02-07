@@ -55,26 +55,20 @@
 ================================================================================
 """
 
-import json
-import time
-import secrets
-import os
-import sys
-import re
-import subprocess
-import webbrowser
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk, simpledialog
-import threading
-import ssl
-import urllib.request
-import urllib.error
 import base64
-import platform
+import json
+import os
+import re
+import secrets
 import shutil
+import ssl
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime
+from tkinter import messagebox
+
 from steam_collection_manager import BackupManager
-from steam_account_manager import SteamAccountScanner
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -153,7 +147,7 @@ class SteamToolboxCore:
         val_obj = {"id": col_id, "name": name + self.induce_suffix, "added": app_ids, "removed": []}
         new_entry = [storage_key, {"key": storage_key, "timestamp": int(time.time()),
                                    "value": json.dumps(val_obj, ensure_ascii=False, separators=(',', ':')),
-                                   "version": self.protected_next_version(data),
+                                   "version": self.next_version(data),
                                    "conflictResolutionMethod": "custom", "strMethodId": "union-collections"}]
         data.append(new_entry)
 
@@ -1169,7 +1163,7 @@ class SteamToolboxCore:
         val_obj['name'] = f"{clean_name}{self.induce_suffix}"
         target_entry[1]['value'] = json.dumps(val_obj, ensure_ascii=False, separators=(',', ':'))
         target_entry[1]['timestamp'] = int(time.time())
-        target_entry[1]['version'] = self._next_version(data)
+        target_entry[1]['version'] = self.next_version(data)
         target_entry[1].setdefault('conflictResolutionMethod', 'custom')
         target_entry[1].setdefault('strMethodId', 'union-collections')
 
