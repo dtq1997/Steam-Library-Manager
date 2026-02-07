@@ -59,7 +59,9 @@ import json
 import time
 import secrets
 import os
+import sys
 import re
+import subprocess
 import webbrowser
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, simpledialog
@@ -584,8 +586,13 @@ class SteamToolbox:
         self.json_name = "cloud-storage-namespace-1.json"
         self.current_dir = None
         
-        # 配置文件路径（全局）
-        self.global_config_path = os.path.join(os.path.expanduser("~"), ".steam_toolbox_config.json")
+        # 数据目录（统一存放配置和缓存）
+        self.data_dir = os.path.join(os.path.expanduser("~"), ".steam_toolbox")
+        os.makedirs(self.data_dir, exist_ok=True)
+        self.global_config_path = os.path.join(self.data_dir, "config.json")
+        
+        # 迁移旧版文件（从主目录散落文件 → 统一目录）
+        self._migrate_old_files()
         
         self.induce_suffix = "(删除这段字以触发云同步)"
         self.disclaimer = f"\n\n(若其中包含未拥有的游戏、重复条目或是 DLC，会导致 Steam 收藏夹内显示的数目偏少。)"
@@ -602,6 +609,22 @@ class SteamToolbox:
         self.current_dir = os.path.dirname(self.json_path)
         self.backup_manager = BackupManager(self.json_path)
     
+    def _migrate_old_files(self):
+        """将旧版散落在主目录的文件迁移到统一数据目录"""
+        home = os.path.expanduser("~")
+        migrations = [
+            (".steam_toolbox_config.json", "config.json"),
+            (".steam_toolbox_igdb_cache.json", "igdb_cache.json"),
+        ]
+        for old_name, new_name in migrations:
+            old_path = os.path.join(home, old_name)
+            new_path = os.path.join(self.data_dir, new_name)
+            if os.path.exists(old_path) and not os.path.exists(new_path):
+                try:
+                    shutil.move(old_path, new_path)
+                except:
+                    pass
+
     def _load_config(self):
         """加载全局配置文件"""
         if os.path.exists(self.global_config_path):
@@ -764,8 +787,8 @@ class SteamToolbox:
     IGDB_CACHE_EXPIRY_DAYS = 7  # 缓存有效期（天）
     
     def _get_igdb_cache_path(self):
-        """获取 IGDB 缓存文件路径（与全局配置文件同目录）"""
-        return os.path.join(os.path.expanduser("~"), ".steam_toolbox_igdb_cache.json")
+        """获取 IGDB 缓存文件路径"""
+        return os.path.join(self.data_dir, "igdb_cache.json")
     
     def _load_igdb_cache(self):
         """加载 IGDB 缓存"""
@@ -816,15 +839,25 @@ class SteamToolbox:
         """获取缓存摘要信息，用于 UI 显示
         
         Returns:
-            dict: {'total_genres': int, 'total_games': int, 'oldest_at': float, 'newest_at': float}
+            dict: {'total_genres': int, 'total_games': int, 'oldest_at': float, 'newest_at': float,
+                   'is_full_dump': bool, 'total_steam_games': int}
                   如果无缓存则返回 None
         """
         cache = self._load_igdb_cache()
         if not cache:
             return None
-        total_genres = len(cache)
-        total_games = sum(len(entry.get("steam_ids", [])) for entry in cache.values())
-        timestamps = [entry.get("cached_at", 0) for entry in cache.values() if entry.get("cached_at")]
+        
+        meta = cache.get("_meta", {})
+        is_full_dump = meta.get("type") == "full_dump"
+        
+        # 统计时排除 _meta 键
+        genre_entries = {k: v for k, v in cache.items() if k != "_meta" and isinstance(v, dict)}
+        if not genre_entries:
+            return None
+        
+        total_genres = len(genre_entries)
+        total_games = sum(len(entry.get("steam_ids", [])) for entry in genre_entries.values())
+        timestamps = [entry.get("cached_at", 0) for entry in genre_entries.values() if entry.get("cached_at")]
         if not timestamps:
             return None
         return {
@@ -832,6 +865,8 @@ class SteamToolbox:
             'total_games': total_games,
             'oldest_at': min(timestamps),
             'newest_at': max(timestamps),
+            'is_full_dump': is_full_dump,
+            'total_steam_games': meta.get("total_steam_games", 0),
         }
     
     def _clear_igdb_genre_cache(self):
@@ -864,32 +899,23 @@ class SteamToolbox:
                 return None, f"请求失败：{str(e)}"
         return None, "达到最大重试次数（速率限制）"
 
-    def _fetch_igdb_games_by_genre(self, genre_id, genre_name, progress_callback=None, force_refresh=False):
-        """根据类型 ID 获取该类型下所有游戏的 Steam AppID
+    def _build_igdb_full_cache(self, progress_callback=None, cancel_flag=None):
+        """下载 IGDB 中所有有 Steam 关联的游戏及其类型信息，存入本地缓存。
         
-        优先使用本地缓存，缓存过期或 force_refresh=True 时才从 API 获取。
-        采用两步法：
-        1. 查询 /v4/games 端点，按 genre 过滤，获取所有符合条件的 game ID
-           使用 cursor-based pagination（where id > last_id）绕开 offset 10000 上限
-        2. 批量查询 /v4/external_games 端点，获取这些游戏的 Steam AppID
-        获取完成后自动写入本地缓存。
+        策略：先从 external_games 拉取所有 Steam 关联，再批量查 genres。
+        
+        Args:
+            progress_callback: fn(current, total, phase_str, detail_str)
+                               current/total 用于驱动进度条（total>0 表示已知总量）
+            cancel_flag: list[bool]，cancel_flag[0]=True 时中止
+            
+        Returns:
+            (genre_map, error): genre_map = {genre_id: [steam_app_ids]}, error = str | None
         """
-        # === 检查本地缓存 ===
-        if not force_refresh:
-            cached_ids, cached_at = self._get_igdb_genre_cache(genre_id)
-            if cached_ids is not None and self._is_igdb_cache_valid(cached_at):
-                if progress_callback:
-                    age_hours = (time.time() - cached_at) / 3600
-                    progress_callback(len(cached_ids), len(cached_ids),
-                        f"使用本地缓存", f"{genre_name}: {len(cached_ids)} 个游戏（缓存于 {age_hours:.0f} 小时前）")
-                return cached_ids, None
-        
-        # === 从 API 获取 ===
         client_id, _ = self._get_igdb_credentials()
         access_token, error = self._get_igdb_access_token()
-        
         if error:
-            return [], error
+            return {}, error
         
         headers = {
             'Client-ID': client_id,
@@ -897,84 +923,166 @@ class SteamToolbox:
             'Accept': 'application/json',
         }
         
-        # ===== 第一步：从 /v4/games 获取所有符合类型的游戏 ID =====
-        all_game_ids = []
+        # ===== 预查询：获取 Steam 关联记录的最大 ID，用于估算进度 =====
+        # external_game_source = 1 即 Steam（旧字段 category 已被 IGDB 废弃，全部为 null）
+        if progress_callback:
+            progress_callback(0, 0, "正在估算数据量...", "")
+        
+        max_ext_id = 0
+        body = "fields id; where external_game_source = 1; sort id desc; limit 1;"
+        results, err = self._igdb_api_request(
+            "https://api.igdb.com/v4/external_games", body, headers)
+        if results:
+            max_ext_id = results[0].get('id', 0)
+        time.sleep(0.28)
+        
+        # ===== 第1步：遍历 external_games 获取所有 Steam 关联 =====
+        # igdb_game_id → steam_app_id
+        game_to_steam = {}
         last_id = 0
         limit = 500
         
         while True:
-            if progress_callback:
-                progress_callback(len(all_game_ids), 0,
-                    f"第1步：检索 {genre_name} 类型游戏...",
-                    f"已发现 {len(all_game_ids)} 个游戏")
+            if cancel_flag and cancel_flag[0]:
+                return {}, "用户取消"
             
-            body = (f"fields id; "
-                    f"where genres = [{genre_id}] & version_parent = null & id > {last_id}; "
+            if progress_callback:
+                # 用 last_id / max_ext_id 估算第1步进度（占总体 50%）
+                step1_pct = (last_id / max_ext_id * 50) if max_ext_id > 0 else 0
+                progress_callback(int(step1_pct), 100,
+                    "正在下载 Steam 游戏列表...",
+                    f"已获取 {len(game_to_steam)} 个游戏")
+            
+            body = (f"fields id,uid,game; "
+                    f"where external_game_source = 1 & id > {last_id}; "
                     f"sort id asc; limit {limit};")
             
-            results, err = self._igdb_api_request("https://api.igdb.com/v4/games", body, headers)
+            results, err = self._igdb_api_request(
+                "https://api.igdb.com/v4/external_games", body, headers)
             
             if err:
-                return [], f"获取游戏列表失败：{err}"
-            
+                return {}, f"下载 Steam 游戏列表失败：{err}"
             if not results:
                 break
             
             for item in results:
-                gid = item.get('id')
-                if gid:
-                    all_game_ids.append(gid)
-                    last_id = gid
+                uid = item.get('uid', '')
+                game_id = item.get('game')
+                ext_id = item.get('id', 0)
+                if uid and uid.isdigit() and game_id:
+                    game_to_steam[int(game_id)] = int(uid)
+                if ext_id > last_id:
+                    last_id = ext_id
             
             if len(results) < limit:
                 break
-            
             time.sleep(0.28)
         
-        if not all_game_ids:
-            # 即使结果为空也缓存，避免反复请求
-            self._set_igdb_genre_cache(genre_id, [])
-            return [], None
+        if not game_to_steam:
+            return {}, "未找到任何 Steam 游戏"
         
-        # ===== 第二步：批量查询 external_games 获取 Steam AppID =====
-        all_steam_ids = []
-        steam_id_set = set()
-        batch_size = 200
+        # ===== 第2步：批量查询这些游戏的 genres =====
+        all_game_ids = list(game_to_steam.keys())
+        genre_map = {}  # genre_id → set of steam_app_ids
+        batch_size = 500
         total_batches = (len(all_game_ids) + batch_size - 1) // batch_size
         
         for batch_idx in range(total_batches):
+            if cancel_flag and cancel_flag[0]:
+                return {}, "用户取消"
+            
             if progress_callback:
-                progress_callback(len(steam_id_set), len(all_game_ids),
-                    f"第2步：查询 Steam ID...",
-                    f"进度 {batch_idx+1}/{total_batches}，已匹配 {len(steam_id_set)} 个")
+                # 第2步占总体 50%~100%
+                step2_pct = 50 + (batch_idx / total_batches * 50) if total_batches > 0 else 50
+                progress_callback(int(step2_pct), 100,
+                    "正在下载游戏分类信息...",
+                    f"进度 {batch_idx+1}/{total_batches}（共 {len(all_game_ids)} 个游戏）")
             
             batch = all_game_ids[batch_idx * batch_size : (batch_idx + 1) * batch_size]
-            game_ids_str = ",".join(str(gid) for gid in batch)
+            ids_str = ",".join(str(gid) for gid in batch)
             
-            body = (f"fields uid,game; "
-                    f"where category = 1 & game = ({game_ids_str}); "
-                    f"limit 500;")
+            body = (f"fields id,genres; "
+                    f"where id = ({ids_str}); "
+                    f"limit {limit};")
             
-            results, err = self._igdb_api_request("https://api.igdb.com/v4/external_games", body, headers)
+            results, err = self._igdb_api_request(
+                "https://api.igdb.com/v4/games", body, headers)
             
             if err:
+                time.sleep(0.28)
                 continue
             
             if results:
                 for item in results:
-                    uid = item.get('uid', '')
-                    if uid and uid.isdigit():
-                        steam_id = int(uid)
-                        if steam_id not in steam_id_set:
-                            steam_id_set.add(steam_id)
-                            all_steam_ids.append(steam_id)
+                    gid = item.get('id')
+                    genres = item.get('genres', [])
+                    if gid and gid in game_to_steam:
+                        steam_id = game_to_steam[gid]
+                        for genre_id in genres:
+                            genre_map.setdefault(genre_id, set()).add(steam_id)
             
             time.sleep(0.28)
         
-        # === 写入本地缓存 ===
-        self._set_igdb_genre_cache(genre_id, all_steam_ids)
+        # ===== 第3步：写入缓存 =====
+        cache = {}
+        now = time.time()
+        for genre_id, steam_ids_set in genre_map.items():
+            cache[str(genre_id)] = {
+                "steam_ids": sorted(steam_ids_set),
+                "cached_at": now,
+            }
+        cache["_meta"] = {
+            "type": "full_dump",
+            "cached_at": now,
+            "total_steam_games": len(game_to_steam),
+            "total_genres": len(genre_map),
+        }
+        self._save_igdb_cache(cache)
         
-        return all_steam_ids, None
+        if progress_callback:
+            progress_callback(100, 100,
+                "✅ 下载完成",
+                f"共 {len(game_to_steam)} 个 Steam 游戏，覆盖 {len(genre_map)} 个类型")
+        
+        return {gid: sorted(sids) for gid, sids in genre_map.items()}, None
+
+    def _fetch_igdb_games_by_genre(self, genre_id, genre_name, progress_callback=None, force_refresh=False):
+        """根据类型 ID 获取该类型下所有游戏的 Steam AppID
+        
+        优先使用本地全量缓存。如果缓存不存在或已过期，则自动触发全量构建。
+        """
+        if not force_refresh:
+            # 先检查该类型是否有缓存
+            cached_ids, cached_at = self._get_igdb_genre_cache(genre_id)
+            if cached_ids is not None and self._is_igdb_cache_valid(cached_at):
+                if progress_callback:
+                    age_hours = (time.time() - cached_at) / 3600
+                    progress_callback(len(cached_ids), len(cached_ids),
+                        f"使用本地缓存", f"{genre_name}: {len(cached_ids)} 个游戏（缓存于 {age_hours:.0f} 小时前）")
+                return cached_ids, None
+            
+            # 该类型无缓存，但全量缓存可能已构建（只是该类型确实没有 Steam 游戏）
+            cache = self._load_igdb_cache()
+            meta = cache.get("_meta", {})
+            if meta.get("type") == "full_dump" and self._is_igdb_cache_valid(meta.get("cached_at", 0)):
+                # 全量缓存有效，该类型确实无数据
+                if progress_callback:
+                    age_hours = (time.time() - meta["cached_at"]) / 3600
+                    progress_callback(0, 0,
+                        f"使用本地缓存", f"{genre_name}: 0 个 Steam 游戏（缓存于 {age_hours:.0f} 小时前）")
+                return [], None
+        
+        # === 缓存不存在或已过期：触发下载 ===
+        if progress_callback:
+            progress_callback(0, 0, "本地数据不完整，正在从 IGDB 下载...", "首次下载约需 5-8 分钟")
+        
+        genre_map, error = self._build_igdb_full_cache(progress_callback)
+        if error:
+            return [], error
+        
+        # 从刚构建的缓存中返回结果
+        steam_ids = genre_map.get(genre_id, [])
+        return steam_ids, None
 
     def load_json(self):
         if not self.json_path or not os.path.exists(self.json_path):
@@ -2645,10 +2753,69 @@ class SteamToolbox:
         tk.Button(igdb_btn_frame, text="☐ 取消全选类型", command=deselect_all_igdb, font=("微软雅黑", 8)).pack(side=tk.LEFT, padx=(0, 5))
         
         def force_rescan_igdb():
-            igdb_force_refresh[0] = True
-            messagebox.showinfo("提示", "已设为重新扫描模式。\n\n下次点击「建立为新收藏夹」或「更新收藏夹」时，IGDB 类型数据将跳过本地缓存，从服务器重新获取。\n\n获取完成后会自动更新本地缓存。")
+            """从 IGDB 重新下载所有 Steam 游戏及分类数据"""
+            if not igdb_configured:
+                messagebox.showwarning("提示", "请先在主界面配置 IGDB API 凭证。")
+                return
+            
+            if is_fetching[0]:
+                messagebox.showwarning("提示", "正在执行其他操作，请稍候。")
+                return
+            
+            if not messagebox.askyesno("重新下载 IGDB 数据", 
+                    "将从 IGDB 重新下载所有 Steam 游戏及分类数据到本地。\n\n"
+                    "约需 5-8 分钟，期间请勿关闭窗口。\n\n"
+                    "确认开始？"):
+                return
+            
+            is_fetching[0] = True
+            for btn in btn_widgets:
+                btn.config(state=tk.DISABLED)
+            
+            cancel_flag = [False]
+            
+            def rebuild_thread():
+                def progress_cb(current, total, phase, detail):
+                    def _up():
+                        status_var.set(phase)
+                        detail_var.set(detail)
+                        # 真进度条：total>0 表示已知总量
+                        if total > 0:
+                            progress_bar.config(mode='determinate', maximum=total)
+                            progress_bar['value'] = current
+                        else:
+                            if str(progress_bar.cget('mode')) != 'indeterminate':
+                                progress_bar.config(mode='indeterminate')
+                                progress_bar.start(15)
+                    rec_win.after(0, _up)
+                
+                def show():
+                    progress_bar.config(mode='determinate', maximum=100, value=0)
+                    progress_bar.pack(padx=20, pady=(5, 0), fill=tk.X)
+                    detail_label.pack(padx=20, anchor=tk.W)
+                rec_win.after(0, show)
+                
+                _, error = self._build_igdb_full_cache(progress_cb, cancel_flag)
+                
+                def done():
+                    is_fetching[0] = False
+                    progress_bar.stop()
+                    progress_bar.pack_forget()
+                    detail_label.pack_forget()
+                    detail_var.set("")
+                    for btn in btn_widgets:
+                        btn.config(state=tk.NORMAL)
+                    refresh_igdb_cache_status()
+                    if error:
+                        status_var.set(f"❌ 下载失败：{error}")
+                    else:
+                        status_var.set("✅ IGDB 数据下载完成！")
+                
+                rec_win.after(0, done)
+            
+            threading.Thread(target=rebuild_thread, daemon=True).start()
         
-        tk.Button(igdb_btn_frame, text="🔄 重新扫描", command=force_rescan_igdb,
+        tk.Button(igdb_btn_frame, text="🔄 重新下载 IGDB 数据", command=force_rescan_igdb,
                  font=("微软雅黑", 8), state=tk.NORMAL if igdb_configured else tk.DISABLED).pack(side=tk.LEFT)
         
         # 缓存状态信息
@@ -2664,17 +2831,20 @@ class SteamToolbox:
                     age_str = f"{age_hours:.0f} 小时前"
                 else:
                     age_str = f"{age_hours / 24:.1f} 天前"
-                igdb_cache_var.set(f"💾 本地缓存：{summary['total_genres']} 个类型，共 {summary['total_games']} 个游戏（{age_str}更新）")
+                if summary.get('is_full_dump'):
+                    igdb_cache_var.set(f"💾 已下载：{summary['total_steam_games']} 个 Steam 游戏，{summary['total_genres']} 个类型（{age_str}更新）")
+                else:
+                    igdb_cache_var.set(f"💾 已缓存：{summary['total_genres']} 个类型，共 {summary['total_games']} 个游戏（{age_str}更新）")
                 igdb_cache_label.config(fg="#2e7d32")
             else:
-                igdb_cache_var.set("💾 本地缓存：无（首次获取时将自动缓存，有效期 7 天）")
+                igdb_cache_var.set("💾 尚未下载（首次使用时自动下载，约 5-8 分钟）")
                 igdb_cache_label.config(fg="#888")
         
         refresh_igdb_cache_status()
         
         # 提示信息
-        tk.Label(igdb_frame, text="💡 游戏类型数据来自 IGDB（Internet Game Database），每个类型可能包含数千个游戏", 
-                 font=("微软雅黑", 8), fg="#666").pack(anchor=tk.W, pady=(3, 0))
+        tk.Label(igdb_frame, text="💡 首次使用时会自动从 IGDB 下载所有 Steam 游戏的分类数据（约 5-8 分钟），之后筛选均为本地秒查", 
+                 font=("微软雅黑", 8), fg="#666", wraplength=500, justify=tk.LEFT).pack(anchor=tk.W, pady=(3, 0))
         
         # ===== 状态显示 =====
         status_var = tk.StringVar(value="请勾选要获取的来源，然后点击下方按钮。")
@@ -4031,7 +4201,22 @@ class SteamToolbox:
         d_config.insert(tk.END, "游戏类型分类", "purple")
         d_config.insert(tk.END, "获取游戏列表。")
         d_config.config(state=tk.DISABLED)
-        d_config.pack(fill=tk.X, pady=(5, 20))
+        d_config.pack(fill=tk.X, pady=(5, 10))
+        
+        # ====== 底部：打开数据文件夹 ======
+        def open_data_folder():
+            path = self.data_dir
+            if sys.platform == 'win32':
+                os.startfile(path)
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', path])
+            else:
+                subprocess.Popen(['xdg-open', path])
+        
+        bottom_row = tk.Frame(right_panel)
+        bottom_row.pack(fill=tk.X, padx=35, pady=(0, 10))
+        tk.Button(bottom_row, text="📂 打开数据文件夹", command=open_data_folder,
+                  font=("微软雅黑", 8), fg="#888", relief=tk.FLAT, cursor="hand2").pack(side=tk.RIGHT)
         
         root.update_idletasks()
         cw, ch = root.winfo_reqwidth(), root.winfo_reqheight()
