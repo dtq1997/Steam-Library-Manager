@@ -1,4 +1,4 @@
-from core import SteamToolbox
+from ui import SteamToolbox
 
 if __name__ == "__main__":
     app = SteamToolbox()
