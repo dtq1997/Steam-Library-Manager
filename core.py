@@ -74,6 +74,8 @@ import platform
 import shutil
 from datetime import datetime
 from pathlib import Path
+from steam_collection_manager import BackupManager
+from steam_account_manager import SteamAccountScanner
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -82,497 +84,6 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None  # 返回 None 表示不跟随重定向
 
 
-class SteamAccountScanner:
-    """Steam 账号扫描器：自动发现系统中的 Steam 账号"""
-    
-    @staticmethod
-    def get_steam_paths():
-        """获取可能的 Steam 安装路径"""
-        system = platform.system()
-        paths = []
-        
-        # 检测是否在 WSL 环境中
-        is_wsl = False
-        if system == "Linux":
-            try:
-                with open("/proc/version", "r") as f:
-                    if "microsoft" in f.read().lower():
-                        is_wsl = True
-            except:
-                pass
-        
-        if system == "Windows":
-            # Windows 常见路径
-            possible_paths = [
-                os.path.expandvars(r"%ProgramFiles(x86)%\Steam"),
-                os.path.expandvars(r"%ProgramFiles%\Steam"),
-                r"C:\Steam",
-                r"D:\Steam",
-                r"E:\Steam",
-                r"D:\Program Files (x86)\Steam",
-                r"D:\Program Files\Steam",
-                r"E:\Program Files (x86)\Steam",
-                r"E:\Program Files\Steam",
-            ]
-            # 从注册表尝试获取（如果可能）
-            try:
-                import winreg
-                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam")
-                install_path, _ = winreg.QueryValueEx(key, "InstallPath")
-                winreg.CloseKey(key)
-                if install_path and install_path not in possible_paths:
-                    paths.append(install_path)
-            except:
-                pass
-            
-            paths.extend(possible_paths)
-            
-        elif system == "Darwin":  # macOS
-            home = os.path.expanduser("~")
-            paths = [
-                os.path.join(home, "Library/Application Support/Steam"),
-                "/Applications/Steam.app/Contents/MacOS/Steam",
-            ]
-            
-        elif system == "Linux":
-            home = os.path.expanduser("~")
-            paths = [
-                os.path.join(home, ".steam/steam"),
-                os.path.join(home, ".local/share/Steam"),
-                os.path.join(home, ".steam"),
-            ]
-            
-            # WSL 环境：额外搜索 Windows 端的 Steam 路径
-            if is_wsl:
-                wsl_windows_paths = [
-                    "/mnt/c/Program Files (x86)/Steam",
-                    "/mnt/c/Program Files/Steam",
-                    "/mnt/c/Steam",
-                    "/mnt/d/Steam",
-                    "/mnt/d/Program Files (x86)/Steam",
-                    "/mnt/d/Program Files/Steam",
-                    "/mnt/e/Steam",
-                    "/mnt/e/Program Files (x86)/Steam",
-                    "/mnt/e/Program Files/Steam",
-                    "/mnt/f/Steam",
-                    "/mnt/f/Program Files (x86)/Steam",
-                    "/mnt/f/Program Files/Steam",
-                ]
-                paths.extend(wsl_windows_paths)
-        
-        return [p for p in paths if os.path.exists(p)]
-    
-    @staticmethod
-    def scan_accounts():
-        """扫描所有 Steam 账号
-        
-        Returns:
-            list of dict: [{'friend_code': '123456', 'userdata_path': '/path/to/userdata/123456', 
-                           'json_path': '/path/to/cloud-storage-namespace-1.json', 'persona_name': '...'}]
-        """
-        accounts = []
-        steam_paths = SteamAccountScanner.get_steam_paths()
-        
-        for steam_path in steam_paths:
-            userdata_path = os.path.join(steam_path, "userdata")
-            if not os.path.exists(userdata_path):
-                continue
-            
-            # 遍历 userdata 下的所有文件夹（每个文件夹对应一个账号）
-            try:
-                for entry in os.listdir(userdata_path):
-                    entry_path = os.path.join(userdata_path, entry)
-                    if not os.path.isdir(entry_path):
-                        continue
-                    if not entry.isdigit():
-                        continue
-                    
-                    friend_code = entry
-                    
-                    # 检查 cloud-storage-namespace-1.json 是否存在
-                    json_path = os.path.join(entry_path, "config", "cloudstorage", "cloud-storage-namespace-1.json")
-                    
-                    if os.path.exists(json_path):
-                        # 尝试获取用户名（从 localconfig.vdf）
-                        persona_name = SteamAccountScanner._get_persona_name(entry_path, friend_code)
-                        
-                        accounts.append({
-                            'friend_code': friend_code,
-                            'userdata_path': entry_path,
-                            'json_path': json_path,
-                            'persona_name': persona_name,
-                            'steam_path': steam_path,
-                        })
-            except PermissionError:
-                continue
-        
-        return accounts
-    
-    @staticmethod
-    def _get_persona_name(userdata_path, friend_code):
-        """尝试从配置文件获取用户昵称"""
-        # 尝试从 localconfig.vdf 获取
-        localconfig_path = os.path.join(userdata_path, "config", "localconfig.vdf")
-        if os.path.exists(localconfig_path):
-            try:
-                with open(localconfig_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                # 简单的正则匹配 PersonaName
-                match = re.search(r'"PersonaName"\s+"([^"]+)"', content)
-                if match:
-                    return match.group(1)
-            except:
-                pass
-        
-        return f"Steam 用户 {friend_code}"
-
-
-class BackupManager:
-    """备份管理器：管理 JSON 文件的备份"""
-    
-    def __init__(self, json_path):
-        self.json_path = json_path
-        self.json_dir = os.path.dirname(json_path)
-        self.backup_dir = os.path.join(self.json_dir, "backups")
-        self.json_name = os.path.basename(json_path)
-    
-    def ensure_backup_dir(self):
-        """确保备份目录存在"""
-        if not os.path.exists(self.backup_dir):
-            os.makedirs(self.backup_dir)
-    
-    def create_backup(self, description=""):
-        """创建备份
-        
-        Args:
-            description: 备份描述（可选）
-        
-        Returns:
-            str: 备份文件路径，失败返回 None
-        """
-        if not os.path.exists(self.json_path):
-            return None
-        
-        self.ensure_backup_dir()
-        
-        # 生成备份文件名：原文件名_时间戳.json
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_name = f"{os.path.splitext(self.json_name)[0]}_{timestamp}.json"
-        backup_path = os.path.join(self.backup_dir, backup_name)
-        
-        try:
-            shutil.copy2(self.json_path, backup_path)
-            
-            # 保存备份元数据
-            self._save_backup_metadata(backup_name, description)
-            
-            return backup_path
-        except Exception as e:
-            print(f"创建备份失败: {e}")
-            return None
-    
-    def _save_backup_metadata(self, backup_name, description):
-        """保存备份元数据"""
-        metadata_path = os.path.join(self.backup_dir, "backup_metadata.json")
-        metadata = {}
-        
-        if os.path.exists(metadata_path):
-            try:
-                with open(metadata_path, 'r', encoding='utf-8') as f:
-                    metadata = json.load(f)
-            except:
-                metadata = {}
-        
-        if 'backups' not in metadata:
-            metadata['backups'] = {}
-        
-        metadata['backups'][backup_name] = {
-            'created_at': datetime.now().isoformat(),
-            'description': description,
-            'original_file': self.json_name,
-        }
-        
-        try:
-            with open(metadata_path, 'w', encoding='utf-8') as f:
-                json.dump(metadata, f, ensure_ascii=False, indent=2)
-        except:
-            pass
-    
-    def list_backups(self):
-        """列出所有备份
-        
-        Returns:
-            list of dict: [{'filename': '...', 'path': '...', 'created_at': '...', 'description': '...', 'size': ...}]
-        """
-        if not os.path.exists(self.backup_dir):
-            return []
-        
-        backups = []
-        metadata = self._load_metadata()
-        
-        for entry in os.listdir(self.backup_dir):
-            if not entry.endswith('.json') or entry == 'backup_metadata.json':
-                continue
-            
-            backup_path = os.path.join(self.backup_dir, entry)
-            if not os.path.isfile(backup_path):
-                continue
-            
-            # 从文件名解析时间戳
-            try:
-                # 格式: cloud-storage-namespace-1_20240101_120000.json
-                match = re.search(r'_(\d{8}_\d{6})\.json$', entry)
-                if match:
-                    ts_str = match.group(1)
-                    created_at = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
-                else:
-                    created_at = datetime.fromtimestamp(os.path.getmtime(backup_path))
-            except:
-                created_at = datetime.fromtimestamp(os.path.getmtime(backup_path))
-            
-            # 获取元数据中的描述
-            meta = metadata.get('backups', {}).get(entry, {})
-            description = meta.get('description', '')
-            
-            backups.append({
-                'filename': entry,
-                'path': backup_path,
-                'created_at': created_at,
-                'description': description,
-                'size': os.path.getsize(backup_path),
-            })
-        
-        # 按时间倒序排列
-        backups.sort(key=lambda x: x['created_at'], reverse=True)
-        return backups
-    
-    def _load_metadata(self):
-        """加载备份元数据"""
-        metadata_path = os.path.join(self.backup_dir, "backup_metadata.json")
-        if os.path.exists(metadata_path):
-            try:
-                with open(metadata_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except:
-                pass
-        return {}
-    
-    def restore_backup(self, backup_filename):
-        """恢复备份
-        
-        Args:
-            backup_filename: 备份文件名
-        
-        Returns:
-            bool: 是否成功
-        """
-        backup_path = os.path.join(self.backup_dir, backup_filename)
-        if not os.path.exists(backup_path):
-            return False
-        
-        try:
-            # 先备份当前文件
-            self.create_backup(description="恢复前自动备份")
-            
-            # 恢复
-            shutil.copy2(backup_path, self.json_path)
-            return True
-        except Exception as e:
-            print(f"恢复备份失败: {e}")
-            return False
-    
-    def delete_backup(self, backup_filename):
-        """删除备份
-        
-        Args:
-            backup_filename: 备份文件名
-        
-        Returns:
-            bool: 是否成功
-        """
-        backup_path = os.path.join(self.backup_dir, backup_filename)
-        if not os.path.exists(backup_path):
-            return False
-        
-        try:
-            os.remove(backup_path)
-            
-            # 更新元数据
-            metadata_path = os.path.join(self.backup_dir, "backup_metadata.json")
-            if os.path.exists(metadata_path):
-                try:
-                    with open(metadata_path, 'r', encoding='utf-8') as f:
-                        metadata = json.load(f)
-                    if 'backups' in metadata and backup_filename in metadata['backups']:
-                        del metadata['backups'][backup_filename]
-                        with open(metadata_path, 'w', encoding='utf-8') as f:
-                            json.dump(metadata, f, ensure_ascii=False, indent=2)
-                except:
-                    pass
-            
-            return True
-        except Exception as e:
-            print(f"删除备份失败: {e}")
-            return False
-    
-    def compare_with_current(self, backup_filename):
-        """比较备份与当前文件的差异
-        
-        Args:
-            backup_filename: 备份文件名
-        
-        Returns:
-            dict: 差异信息
-        """
-        backup_path = os.path.join(self.backup_dir, backup_filename)
-        
-        try:
-            with open(backup_path, 'r', encoding='utf-8') as f:
-                backup_data = json.load(f)
-            with open(self.json_path, 'r', encoding='utf-8') as f:
-                current_data = json.load(f)
-        except Exception as e:
-            return {'error': str(e)}
-        
-        return self._compare_collections(backup_data, current_data)
-    
-    def compare_backups(self, backup1_filename, backup2_filename):
-        """比较两个备份之间的差异
-        
-        Args:
-            backup1_filename: 较旧的备份文件名
-            backup2_filename: 较新的备份文件名
-        
-        Returns:
-            dict: 差异信息
-        """
-        backup1_path = os.path.join(self.backup_dir, backup1_filename)
-        backup2_path = os.path.join(self.backup_dir, backup2_filename)
-        
-        try:
-            with open(backup1_path, 'r', encoding='utf-8') as f:
-                data1 = json.load(f)
-            with open(backup2_path, 'r', encoding='utf-8') as f:
-                data2 = json.load(f)
-        except Exception as e:
-            return {'error': str(e)}
-        
-        return self._compare_collections(data1, data2)
-    
-    def _compare_collections(self, old_data, new_data):
-        """比较两个数据的收藏夹差异
-        
-        Returns:
-            dict: {
-                'added_collections': [...],      # 新增的收藏夹
-                'removed_collections': [...],    # 删除的收藏夹
-                'modified_collections': [...],   # 修改的收藏夹（含详细变化）
-                'unchanged_collections': [...],  # 未变化的收藏夹
-                'summary': {...}                 # 摘要信息
-            }
-        """
-        def extract_collections(data):
-            """提取收藏夹信息"""
-            collections = {}
-            for entry in data:
-                key = entry[0]
-                meta = entry[1]
-                if key.startswith("user-collections."):
-                    if meta.get("is_deleted") is True or "value" not in meta:
-                        continue
-                    try:
-                        val_obj = json.loads(meta['value'])
-                        col_id = val_obj.get("id", key)
-                        collections[col_id] = {
-                            'name': val_obj.get("name", "未命名"),
-                            'added': set(val_obj.get("added", [])),
-                            'removed': set(val_obj.get("removed", [])),
-                            'is_dynamic': "filterSpec" in val_obj,
-                            'raw_value': val_obj,
-                        }
-                    except:
-                        continue
-            return collections
-        
-        old_cols = extract_collections(old_data)
-        new_cols = extract_collections(new_data)
-        
-        old_ids = set(old_cols.keys())
-        new_ids = set(new_cols.keys())
-        
-        added_ids = new_ids - old_ids
-        removed_ids = old_ids - new_ids
-        common_ids = old_ids & new_ids
-        
-        result = {
-            'added_collections': [],
-            'removed_collections': [],
-            'modified_collections': [],
-            'unchanged_collections': [],
-            'summary': {
-                'total_added': 0,
-                'total_removed': 0,
-                'total_modified': 0,
-                'total_unchanged': 0,
-            }
-        }
-        
-        # 新增的收藏夹
-        for col_id in added_ids:
-            col = new_cols[col_id]
-            result['added_collections'].append({
-                'id': col_id,
-                'name': col['name'],
-                'game_count': len(col['added']),
-                'is_dynamic': col['is_dynamic'],
-            })
-        result['summary']['total_added'] = len(added_ids)
-        
-        # 删除的收藏夹
-        for col_id in removed_ids:
-            col = old_cols[col_id]
-            result['removed_collections'].append({
-                'id': col_id,
-                'name': col['name'],
-                'game_count': len(col['added']),
-                'is_dynamic': col['is_dynamic'],
-            })
-        result['summary']['total_removed'] = len(removed_ids)
-        
-        # 检查修改的收藏夹
-        for col_id in common_ids:
-            old_col = old_cols[col_id]
-            new_col = new_cols[col_id]
-            
-            # 检查是否有变化
-            name_changed = old_col['name'] != new_col['name']
-            added_games = new_col['added'] - old_col['added']
-            removed_games = old_col['added'] - new_col['added']
-            
-            if name_changed or added_games or removed_games:
-                result['modified_collections'].append({
-                    'id': col_id,
-                    'old_name': old_col['name'],
-                    'new_name': new_col['name'],
-                    'name_changed': name_changed,
-                    'added_games': list(added_games),
-                    'removed_games': list(removed_games),
-                    'old_game_count': len(old_col['added']),
-                    'new_game_count': len(new_col['added']),
-                    'is_dynamic': new_col['is_dynamic'],
-                })
-            else:
-                result['unchanged_collections'].append({
-                    'id': col_id,
-                    'name': new_col['name'],
-                    'game_count': len(new_col['added']),
-                    'is_dynamic': new_col['is_dynamic'],
-                })
-        
-        result['summary']['total_modified'] = len(result['modified_collections'])
-        result['summary']['total_unchanged'] = len(result['unchanged_collections'])
-        
-        return result
 
 
 class SteamToolbox:
@@ -707,37 +218,37 @@ class SteamToolbox:
         client_id, client_secret = self._get_igdb_credentials()
         if not client_id or not client_secret:
             return None, "未配置 IGDB API 凭证"
-        
+
         config = self._load_config()
         cached_token = config.get("igdb_access_token", "")
         expires_at = config.get("igdb_token_expires_at", 0)
-        
+
         # 检查缓存的令牌是否仍然有效（提前 300 秒过期）
         current_time = int(time.time())
         if not force_refresh and cached_token and expires_at > current_time + 300:
             return cached_token, None
-        
+
         # 请求新的访问令牌
         token_url = f"https://id.twitch.tv/oauth2/token?client_id={client_id}&client_secret={client_secret}&grant_type=client_credentials"
-        
+
         try:
             req = urllib.request.Request(token_url, method='POST')
             with urllib.request.urlopen(req, timeout=15, context=self.ssl_context) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
-            
+
             access_token = data.get("access_token", "")
             expires_in = data.get("expires_in", 0)
-            
+
             if not access_token:
                 return None, "获取访问令牌失败：响应中无 access_token"
-            
+
             # 缓存令牌
             config["igdb_access_token"] = access_token
             config["igdb_token_expires_at"] = current_time + expires_in
             self._save_config(config)
-            
+
             return access_token, None
-            
+
         except urllib.error.HTTPError as e:
             return None, f"HTTP 错误 {e.code}：获取 IGDB 令牌失败"
         except urllib.error.URLError as e:
@@ -749,32 +260,32 @@ class SteamToolbox:
         """获取 IGDB 游戏类型列表"""
         client_id, _ = self._get_igdb_credentials()
         access_token, error = self._get_igdb_access_token()
-        
+
         if error:
             return [], error
-        
+
         if progress_callback:
             progress_callback(0, 0, "正在获取游戏类型列表...", "")
-        
+
         headers = {
             'Client-ID': client_id,
             'Authorization': f'Bearer {access_token}',
             'Accept': 'application/json',
         }
-        
+
         # 获取所有游戏类型
         url = "https://api.igdb.com/v4/genres"
         body = "fields id,name,slug; limit 100;"
-        
+
         try:
             req = urllib.request.Request(url, data=body.encode('utf-8'), headers=headers, method='POST')
             with urllib.request.urlopen(req, timeout=20, context=self.ssl_context) as resp:
                 genres = json.loads(resp.read().decode('utf-8'))
-            
+
             # 按名称排序
             genres.sort(key=lambda x: x.get('name', ''))
             return genres, None
-            
+
         except urllib.error.HTTPError as e:
             return [], f"HTTP 错误 {e.code}：获取类型列表失败"
         except urllib.error.URLError as e:
@@ -783,13 +294,13 @@ class SteamToolbox:
             return [], f"获取失败：{str(e)}"
 
     # ==================== IGDB 本地缓存 ====================
-    
+
     IGDB_CACHE_EXPIRY_DAYS = 7  # 缓存有效期（天）
-    
+
     def _get_igdb_cache_path(self):
         """获取 IGDB 缓存文件路径"""
         return os.path.join(self.data_dir, "igdb_cache.json")
-    
+
     def _load_igdb_cache(self):
         """加载 IGDB 缓存"""
         path = self._get_igdb_cache_path()
@@ -800,7 +311,7 @@ class SteamToolbox:
             except:
                 pass
         return {}
-    
+
     def _save_igdb_cache(self, cache):
         """保存 IGDB 缓存"""
         path = self._get_igdb_cache_path()
@@ -809,7 +320,7 @@ class SteamToolbox:
                 json.dump(cache, f, ensure_ascii=False)
         except:
             pass
-    
+
     def _get_igdb_genre_cache(self, genre_id):
         """获取某个类型的缓存数据，返回 (steam_ids, cached_at_timestamp) 或 (None, None)"""
         cache = self._load_igdb_cache()
@@ -818,7 +329,7 @@ class SteamToolbox:
             entry = cache[genre_key]
             return entry.get("steam_ids", []), entry.get("cached_at", 0)
         return None, None
-    
+
     def _set_igdb_genre_cache(self, genre_id, steam_ids):
         """写入某个类型的缓存数据"""
         cache = self._load_igdb_cache()
@@ -827,17 +338,17 @@ class SteamToolbox:
             "cached_at": time.time(),
         }
         self._save_igdb_cache(cache)
-    
+
     def _is_igdb_cache_valid(self, cached_at):
         """判断缓存是否仍然有效"""
         if not cached_at:
             return False
         age_seconds = time.time() - cached_at
         return age_seconds < self.IGDB_CACHE_EXPIRY_DAYS * 86400
-    
+
     def _get_igdb_cache_summary(self):
         """获取缓存摘要信息，用于 UI 显示
-        
+
         Returns:
             dict: {'total_genres': int, 'total_games': int, 'oldest_at': float, 'newest_at': float,
                    'is_full_dump': bool, 'total_steam_games': int}
@@ -846,15 +357,15 @@ class SteamToolbox:
         cache = self._load_igdb_cache()
         if not cache:
             return None
-        
+
         meta = cache.get("_meta", {})
         is_full_dump = meta.get("type") == "full_dump"
-        
+
         # 统计时排除 _meta 键
         genre_entries = {k: v for k, v in cache.items() if k != "_meta" and isinstance(v, dict)}
         if not genre_entries:
             return None
-        
+
         total_genres = len(genre_entries)
         total_games = sum(len(entry.get("steam_ids", [])) for entry in genre_entries.values())
         timestamps = [entry.get("cached_at", 0) for entry in genre_entries.values() if entry.get("cached_at")]
@@ -868,7 +379,7 @@ class SteamToolbox:
             'is_full_dump': is_full_dump,
             'total_steam_games': meta.get("total_steam_games", 0),
         }
-    
+
     def _clear_igdb_genre_cache(self):
         """清除所有 IGDB 缓存"""
         path = self._get_igdb_cache_path()
@@ -877,9 +388,9 @@ class SteamToolbox:
                 os.remove(path)
             except:
                 pass
-    
+
     # ==================== IGDB API 请求 ====================
-    
+
     def _igdb_api_request(self, url, body, headers):
         """发送 IGDB API 请求，自动处理速率限制和重试"""
         max_retries = 3
@@ -901,14 +412,14 @@ class SteamToolbox:
 
     def _build_igdb_full_cache(self, progress_callback=None, cancel_flag=None):
         """下载 IGDB 中所有有 Steam 关联的游戏及其类型信息，存入本地缓存。
-        
+
         策略：先从 external_games 拉取所有 Steam 关联，再批量查 genres。
-        
+
         Args:
             progress_callback: fn(current, total, phase_str, detail_str)
                                current/total 用于驱动进度条（total>0 表示已知总量）
             cancel_flag: list[bool]，cancel_flag[0]=True 时中止
-            
+
         Returns:
             (genre_map, error): genre_map = {genre_id: [steam_app_ids]}, error = str | None
         """
@@ -916,18 +427,18 @@ class SteamToolbox:
         access_token, error = self._get_igdb_access_token()
         if error:
             return {}, error
-        
+
         headers = {
             'Client-ID': client_id,
             'Authorization': f'Bearer {access_token}',
             'Accept': 'application/json',
         }
-        
+
         # ===== 预查询：获取 Steam 关联记录的最大 ID，用于估算进度 =====
         # external_game_source = 1 即 Steam（旧字段 category 已被 IGDB 废弃，全部为 null）
         if progress_callback:
             progress_callback(0, 0, "正在估算数据量...", "")
-        
+
         max_ext_id = 0
         body = "fields id; where external_game_source = 1; sort id desc; limit 1;"
         results, err = self._igdb_api_request(
@@ -935,36 +446,36 @@ class SteamToolbox:
         if results:
             max_ext_id = results[0].get('id', 0)
         time.sleep(0.28)
-        
+
         # ===== 第1步：遍历 external_games 获取所有 Steam 关联 =====
         # igdb_game_id → steam_app_id
         game_to_steam = {}
         last_id = 0
         limit = 500
-        
+
         while True:
             if cancel_flag and cancel_flag[0]:
                 return {}, "用户取消"
-            
+
             if progress_callback:
                 # 用 last_id / max_ext_id 估算第1步进度（占总体 50%）
                 step1_pct = (last_id / max_ext_id * 50) if max_ext_id > 0 else 0
                 progress_callback(int(step1_pct), 100,
                     "正在下载 Steam 游戏列表...",
                     f"已获取 {len(game_to_steam)} 个游戏")
-            
+
             body = (f"fields id,uid,game; "
                     f"where external_game_source = 1 & id > {last_id}; "
                     f"sort id asc; limit {limit};")
-            
+
             results, err = self._igdb_api_request(
                 "https://api.igdb.com/v4/external_games", body, headers)
-            
+
             if err:
                 return {}, f"下载 Steam 游戏列表失败：{err}"
             if not results:
                 break
-            
+
             for item in results:
                 uid = item.get('uid', '')
                 game_id = item.get('game')
@@ -973,45 +484,45 @@ class SteamToolbox:
                     game_to_steam[int(game_id)] = int(uid)
                 if ext_id > last_id:
                     last_id = ext_id
-            
+
             if len(results) < limit:
                 break
             time.sleep(0.28)
-        
+
         if not game_to_steam:
             return {}, "未找到任何 Steam 游戏"
-        
+
         # ===== 第2步：批量查询这些游戏的 genres =====
         all_game_ids = list(game_to_steam.keys())
         genre_map = {}  # genre_id → set of steam_app_ids
         batch_size = 500
         total_batches = (len(all_game_ids) + batch_size - 1) // batch_size
-        
+
         for batch_idx in range(total_batches):
             if cancel_flag and cancel_flag[0]:
                 return {}, "用户取消"
-            
+
             if progress_callback:
                 # 第2步占总体 50%~100%
                 step2_pct = 50 + (batch_idx / total_batches * 50) if total_batches > 0 else 50
                 progress_callback(int(step2_pct), 100,
                     "正在下载游戏分类信息...",
                     f"进度 {batch_idx+1}/{total_batches}（共 {len(all_game_ids)} 个游戏）")
-            
+
             batch = all_game_ids[batch_idx * batch_size : (batch_idx + 1) * batch_size]
             ids_str = ",".join(str(gid) for gid in batch)
-            
+
             body = (f"fields id,genres; "
                     f"where id = ({ids_str}); "
                     f"limit {limit};")
-            
+
             results, err = self._igdb_api_request(
                 "https://api.igdb.com/v4/games", body, headers)
-            
+
             if err:
                 time.sleep(0.28)
                 continue
-            
+
             if results:
                 for item in results:
                     gid = item.get('id')
@@ -1020,9 +531,9 @@ class SteamToolbox:
                         steam_id = game_to_steam[gid]
                         for genre_id in genres:
                             genre_map.setdefault(genre_id, set()).add(steam_id)
-            
+
             time.sleep(0.28)
-        
+
         # ===== 第3步：写入缓存 =====
         cache = {}
         now = time.time()
@@ -1038,17 +549,17 @@ class SteamToolbox:
             "total_genres": len(genre_map),
         }
         self._save_igdb_cache(cache)
-        
+
         if progress_callback:
             progress_callback(100, 100,
                 "✅ 下载完成",
                 f"共 {len(game_to_steam)} 个 Steam 游戏，覆盖 {len(genre_map)} 个类型")
-        
+
         return {gid: sorted(sids) for gid, sids in genre_map.items()}, None
 
     def _fetch_igdb_games_by_genre(self, genre_id, genre_name, progress_callback=None, force_refresh=False):
         """根据类型 ID 获取该类型下所有游戏的 Steam AppID
-        
+
         优先使用本地全量缓存。如果缓存不存在或已过期，则自动触发全量构建。
         """
         if not force_refresh:
@@ -1060,7 +571,7 @@ class SteamToolbox:
                     progress_callback(len(cached_ids), len(cached_ids),
                         f"使用本地缓存", f"{genre_name}: {len(cached_ids)} 个游戏（缓存于 {age_hours:.0f} 小时前）")
                 return cached_ids, None
-            
+
             # 该类型无缓存，但全量缓存可能已构建（只是该类型确实没有 Steam 游戏）
             cache = self._load_igdb_cache()
             meta = cache.get("_meta", {})
@@ -1071,15 +582,15 @@ class SteamToolbox:
                     progress_callback(0, 0,
                         f"使用本地缓存", f"{genre_name}: 0 个 Steam 游戏（缓存于 {age_hours:.0f} 小时前）")
                 return [], None
-        
+
         # === 缓存不存在或已过期：触发下载 ===
         if progress_callback:
             progress_callback(0, 0, "本地数据不完整，正在从 IGDB 下载...", "首次下载约需 5-8 分钟")
-        
+
         genre_map, error = self._build_igdb_full_cache(progress_callback)
         if error:
             return [], error
-        
+
         # 从刚构建的缓存中返回结果
         steam_ids = genre_map.get(genre_id, [])
         return steam_ids, None
@@ -1097,7 +608,7 @@ class SteamToolbox:
 
     def save_json(self, data, create_backup=True, backup_description=""):
         """保存 JSON 数据到原文件
-        
+
         Args:
             data: 要保存的数据
             create_backup: 是否在保存前创建备份
@@ -1106,7 +617,7 @@ class SteamToolbox:
         if not self.json_path:
             messagebox.showerror("错误", "未选择账号，无法保存。")
             return False
-        
+
         # 创建备份
         if create_backup and self.backup_manager:
             backup_path = self.backup_manager.create_backup(description=backup_description)
@@ -1116,19 +627,19 @@ class SteamToolbox:
                 backup_info = "\n\n⚠️ 备份创建失败"
         else:
             backup_info = ""
-        
+
         # 写入原文件（使用原子写入）
         tmp_path = self.json_path + ".tmp"
         try:
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
-            
+
             # 原子替换
             if os.path.exists(self.json_path):
                 os.replace(tmp_path, self.json_path)
             else:
                 os.rename(tmp_path, self.json_path)
-            
+
             messagebox.showinfo("成功", f"文件已保存：\n{os.path.basename(self.json_path)}{backup_info}")
             return True
         except Exception as e:
@@ -1145,7 +656,7 @@ class SteamToolbox:
     def _get_static_collections(self, data):
         """获取所有收藏夹（含动态）及其 entry 引用，按字母排序"""
         return self._get_all_collections_with_refs(data)
-    
+
     def _get_all_collections_with_refs(self, data):
         """获取所有收藏夹（含动态收藏夹）及其 entry 引用，按字母排序"""
         collections = []
@@ -1205,7 +716,7 @@ class SteamToolbox:
         list_start = html_text.find('id="RecommendationsRows"')
         if list_start == -1:
             list_start = html_text.find('class="creator_grid_ctn"')
-        
+
         if list_start != -1:
             footer_start = html_text.find('id="footer"', list_start)
             search_area = html_text[list_start : (footer_start if footer_start != -1 else len(html_text))]
@@ -1217,7 +728,7 @@ class SteamToolbox:
                 all_ids.extend(m.split(','))
             else:
                 all_ids.append(m)
-        
+
         return list(dict.fromkeys([int(aid) for aid in all_ids if aid.isdigit()]))
 
     def _extract_page_name_from_html(self, html_text, url_hint=""):
@@ -1234,19 +745,19 @@ class SteamToolbox:
                 "category": "分类",
             }
             type_name_cn = type_names.get(page_type, "列表")
-        
+
         if "curator" in html_text.lower() or "鉴赏家" in html_text:
             type_name_cn = "鉴赏家"
         elif "publisher" in html_text.lower():
             type_name_cn = "发行商"
         elif "developer" in html_text.lower():
             type_name_cn = "开发商"
-        
+
         name = None
         match = re.search(r'class="curator_name".*?><a.*?>(.*?)</a>', html_text, re.S)
         if match:
             name = match.group(1).strip()
-        
+
         if not name:
             match = re.search(r'<title>(.*?)</title>', html_text, re.I)
             if match:
@@ -1256,11 +767,11 @@ class SteamToolbox:
                 title = re.sub(r'^Steam 鉴赏家：', '', title)
                 title = re.sub(r'^Steam Curator:\s*', '', title, flags=re.I)
                 name = title.strip()
-        
+
         if name:
             return f"{type_name_cn}：{name}"
         return f"{type_name_cn}：未知"
-    
+
     def _extract_curator_name(self, html_text):
         """从 HTML 中智能提取鉴赏家名称（保持向后兼容）"""
         return self._extract_page_name_from_html(html_text)
@@ -1268,10 +779,10 @@ class SteamToolbox:
     def _extract_steam_list_info(self, url_or_id):
         """从 URL 或直接输入中提取 Steam 列表页面信息"""
         text = url_or_id.strip()
-        
+
         if text.isdigit():
             return ("curator", text)
-        
+
         patterns = [
             (r'/curator/(\d+)', "curator"),
             (r'/publisher/([^/?#]+)', "publisher"),
@@ -1280,12 +791,12 @@ class SteamToolbox:
             (r'/genre/([^/?#]+)', "genre"),
             (r'/category/([^/?#]+)', "category"),
         ]
-        
+
         for pattern, page_type in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 return (page_type, match.group(1))
-        
+
         return (None, None)
 
     def _fetch_steam_list(self, page_type, identifier, progress_callback=None, login_cookies=None):
@@ -1299,35 +810,35 @@ class SteamToolbox:
             "category": "分类",
         }
         type_name_cn = type_names.get(page_type, "列表")
-        
+
         base_cookies = "birthtime=283993201; wants_mature_content=1; mature_content=1; lastagecheckage=1-0-1979; steamCountry=US%7C0"
         has_login = login_cookies is not None and len(login_cookies.strip()) > 0
-        
+
         if has_login:
             cookies = f"{login_cookies}; {base_cookies}"
         else:
             cookies = base_cookies
-        
+
         if page_type in ("curator", "publisher", "developer"):
             return self._fetch_curator_style_api(page_type, identifier, type_name_cn, cookies, has_login, progress_callback)
         else:
             return self._fetch_generic_list(page_type, identifier, type_name_cn, cookies, has_login, progress_callback)
-    
+
     def _fetch_curator_style_api(self, page_type, identifier, type_name_cn, cookies, has_login, progress_callback=None):
         """统一的 ajaxgetfilteredrecommendations API 抓取"""
         from urllib.parse import unquote
-        
+
         page_url = f"https://store.steampowered.com/{page_type}/{identifier}/"
         curator_id = None
         page_name = None
-        
+
         headers_html = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
             'Cookie': cookies,
         }
-        
+
         if page_type == "curator":
             curator_id = identifier
             if progress_callback:
@@ -1336,7 +847,7 @@ class SteamToolbox:
                 req = urllib.request.Request(page_url, headers=headers_html)
                 with urllib.request.urlopen(req, timeout=30, context=self.ssl_context) as resp:
                     html_content = resp.read().decode('utf-8')
-                
+
                 name_patterns = [
                     r'class="curator_name"[^>]*>.*?<a[^>]*>(.*?)</a>',
                     r'<title>Steam 鉴赏家：([^<]+?)</title>',
@@ -1350,7 +861,7 @@ class SteamToolbox:
                         if extracted and len(extracted) < 100:
                             page_name = extracted
                             break
-                            
+
             except urllib.error.HTTPError:
                 pass
             except Exception:
@@ -1358,16 +869,16 @@ class SteamToolbox:
         else:
             if progress_callback:
                 progress_callback(0, 0, "正在获取页面信息...", f"正在访问 {page_type}/{identifier} ...")
-            
+
             try:
                 req = urllib.request.Request(page_url, headers=headers_html)
                 with urllib.request.urlopen(req, timeout=30, context=self.ssl_context) as resp:
                     html_content = resp.read().decode('utf-8')
-                
+
                 clanid_match = re.search(r'curator_clanid[=:][\s"\']*(\d+)', html_content)
                 if clanid_match:
                     curator_id = clanid_match.group(1)
-                
+
                 name_patterns = [
                     r'class="curator_name"[^>]*>.*?<a[^>]*>(.*?)</a>',
                     r'<title>(?:Steam (?:Publisher|Developer):\s*)?([^<]+?)(?:\s*[-–—]\s*Steam)?</title>',
@@ -1380,17 +891,17 @@ class SteamToolbox:
                         if extracted and len(extracted) < 100:
                             page_name = extracted
                             break
-                            
+
             except urllib.error.HTTPError as e:
                 return [], None, f"HTTP 错误 {e.code}：无法访问该{type_name_cn}页面。", has_login
             except Exception as e:
                 return [], None, f"获取页面失败：{str(e)}", has_login
-        
+
         if not curator_id:
             return [], None, f"无法从该{type_name_cn}页面提取 curator ID。", has_login
-        
+
         base_url = f"https://store.steampowered.com/curator/{curator_id}/ajaxgetfilteredrecommendations/"
-        
+
         lang_configs = [
             ("schinese", "zh-CN,zh;q=0.9,en;q=0.8", "简体中文"),
             ("english", "en-US,en;q=0.9", "English"),
@@ -1398,10 +909,10 @@ class SteamToolbox:
             ("tchinese", "zh-TW,zh;q=0.9,en;q=0.8", "繁體中文"),
             ("koreana", "ko,en;q=0.8", "한국어"),
         ]
-        
+
         all_unique_ids = set()
         max_total = 0
-        
+
         for lang_idx, (lang_code, accept_lang, lang_display) in enumerate(lang_configs):
             headers_api = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -1411,38 +922,38 @@ class SteamToolbox:
                 'Referer': page_url,
                 'Cookie': cookies,
             }
-            
+
             start = 0
             count = 100
             total_count = None
             lang_page = 0
-            
+
             if progress_callback:
                 progress_callback(
                     len(all_unique_ids), max_total,
                     f"已获取 {len(all_unique_ids)} 个",
                     f"🌐 扫描语言 [{lang_idx+1}/{len(lang_configs)}]：{lang_display} — 正在连接..."
                 )
-            
+
             while True:
                 url = f"{base_url}?start={start}&count={count}&l={lang_code}"
                 lang_page += 1
-                
+
                 try:
                     req = urllib.request.Request(url, headers=headers_api)
                     with urllib.request.urlopen(req, timeout=30, context=self.ssl_context) as resp:
                         data = json.loads(resp.read().decode('utf-8'))
-                    
+
                     if not data.get('success'):
                         break
-                    
+
                     if total_count is None:
                         total_count = int(data.get('total_count', 0))
                         if total_count == 0:
                             break
                         if total_count > max_total:
                             max_total = total_count
-                    
+
                     html_chunk = data.get('results_html', '')
                     new_in_page = 0
                     if html_chunk:
@@ -1452,12 +963,12 @@ class SteamToolbox:
                             if aid_int not in all_unique_ids:
                                 new_in_page += 1
                             all_unique_ids.add(aid_int)
-                        
+
                         if page_name is None:
                             name_match = re.search(r'class="curator_name"[^>]*>.*?<a[^>]*>(.*?)</a>', html_chunk, re.S)
                             if name_match:
                                 page_name = re.sub(r'<[^>]+>', '', name_match.group(1)).strip()
-                    
+
                     if progress_callback:
                         total_pages = (total_count + count - 1) // count if total_count else "?"
                         progress_callback(
@@ -1465,68 +976,68 @@ class SteamToolbox:
                             f"已获取 {len(all_unique_ids)} 个",
                             f"🌐 [{lang_idx+1}/{len(lang_configs)}] {lang_display} — 第 {lang_page}/{total_pages} 页（本页新增 {new_in_page}，共 {len(chunk_ids) if html_chunk else 0} 条）"
                         )
-                    
+
                     start += count
                     if start >= total_count or not html_chunk:
                         break
-                    
+
                     time.sleep(0.1)
-                        
+
                 except Exception:
                     break
-            
+
             if progress_callback:
                 progress_callback(
                     len(all_unique_ids), max_total if max_total else len(all_unique_ids),
                     f"已获取 {len(all_unique_ids)} 个",
                     f"✅ {lang_display} 扫描完成 — 当前共 {len(all_unique_ids)} 个唯一游戏"
                 )
-            
+
             time.sleep(0.2)
-        
+
         if not all_unique_ids:
             return [], None, f"该{type_name_cn}没有任何游戏，或标识符无效。\n请检查 URL 是否正确。", has_login
-        
+
         unique_ids = list(all_unique_ids)
-        
+
         if page_name:
             display_name = f"{type_name_cn}：{page_name}"
         else:
             display_name = f"{type_name_cn}：{unquote(identifier)}"
-        
+
         return unique_ids, display_name, None, has_login
-    
+
     def _fetch_generic_list(self, page_type, identifier, type_name_cn, cookies, has_login, progress_callback=None):
         """通过通用方式抓取发行商/开发商/系列等页面的游戏列表"""
         from urllib.parse import unquote
-        
+
         base_url = f"https://store.steampowered.com/{page_type}/{identifier}"
-        
+
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
             'Cookie': cookies,
         }
-        
+
         all_unique_ids = set()
         page_name = None
-        
+
         if progress_callback:
             progress_callback(0, 0, "正在获取页面...", f"正在连接 {page_type}/{identifier} ...")
-        
+
         try:
             req = urllib.request.Request(base_url, headers=headers)
             with urllib.request.urlopen(req, timeout=30, context=self.ssl_context) as resp:
                 html_content = resp.read().decode('utf-8')
-            
+
             name_patterns = [
                 r'<div class="curator_name"[^>]*>.*?<a[^>]*>(.*?)</a>',
                 r'<div class="page_title_area[^"]*"[^>]*>.*?<span[^>]*>(.*?)</span>',
                 r'<h2 class="pageheader">(.*?)</h2>',
                 r'<title>([^<]+?)(?:\s*[-–—]\s*Steam|\s*on Steam)?</title>',
             ]
-            
+
             for pattern in name_patterns:
                 match = re.search(pattern, html_content, re.S | re.I)
                 if match:
@@ -1536,18 +1047,18 @@ class SteamToolbox:
                     if extracted_name and len(extracted_name) < 100:
                         page_name = extracted_name
                         break
-            
+
             if not page_name:
                 page_name = unquote(identifier).replace('%20', ' ').replace('+', ' ')
-            
+
             ids = self._extract_ids_from_html(html_content)
             for aid in ids:
                 all_unique_ids.add(aid)
-            
+
             if progress_callback:
                 progress_callback(len(all_unique_ids), len(all_unique_ids), "已获取主页面",
                                   f"📄 主页面提取了 {len(ids)} 个游戏，正在检查分页...")
-            
+
             page = 2
             while True:
                 ajax_url = f"{base_url}?page={page}"
@@ -1555,43 +1066,43 @@ class SteamToolbox:
                     if progress_callback:
                         progress_callback(len(all_unique_ids), len(all_unique_ids), f"正在获取第 {page} 页",
                                           f"📄 正在加载第 {page} 页...")
-                    
+
                     req = urllib.request.Request(ajax_url, headers=headers)
                     with urllib.request.urlopen(req, timeout=15, context=self.ssl_context) as resp:
                         page_html = resp.read().decode('utf-8')
-                    
+
                     page_ids = self._extract_ids_from_html(page_html)
                     if not page_ids or all(aid in all_unique_ids for aid in page_ids):
                         break
-                    
+
                     new_count = sum(1 for aid in page_ids if aid not in all_unique_ids)
                     for aid in page_ids:
                         all_unique_ids.add(aid)
-                    
+
                     if progress_callback:
                         progress_callback(len(all_unique_ids), len(all_unique_ids), f"已获取第 {page} 页",
                                           f"📄 第 {page} 页新增 {new_count} 个游戏，当前共 {len(all_unique_ids)} 个")
-                    
+
                     page += 1
                     time.sleep(0.3)
-                    
+
                     if page > 50:
                         break
-                        
+
                 except Exception:
                     break
-                    
+
         except urllib.error.HTTPError as e:
             return [], None, f"HTTP 错误 {e.code}：无法访问该页面。", has_login
         except Exception as e:
             return [], None, f"获取失败：{str(e)}", has_login
-        
+
         if not all_unique_ids:
             return [], None, f"该{type_name_cn}页面没有找到任何游戏。", has_login
-        
+
         unique_ids = list(all_unique_ids)
         display_name = f"{type_name_cn}：{page_name}"
-        
+
         return unique_ids, display_name, None, has_login
 
     def _extract_ids_from_steamdb_html(self, html_text):
@@ -1603,24 +1114,24 @@ class SteamToolbox:
 
     def _perform_incremental_update(self, data, target_entry, new_ids_from_src, raw_name):
         """核心增量更新逻辑：主收藏夹追加 + 生成两个差异备份文件夹
-        
+
         Returns:
             (added_count, removed_count, total_count, is_updated)
             如果没有新增任何游戏，is_updated 为 False，此时不会做任何修改
         """
         val_obj = json.loads(target_entry[1]['value'])
         old_ids = val_obj.get("added", [])
-        
+
         old_set = set(old_ids)
         src_set = set(new_ids_from_src)
-        
+
         added_list = [aid for aid in new_ids_from_src if aid not in old_set]
         removed_list = [aid for aid in old_ids if aid not in src_set]
-        
+
         # 如果没有新增任何游戏，不做任何操作
         if not added_list:
             return 0, len(removed_list), len(old_ids), False
-        
+
         # 有新增，执行更新
         val_obj['added'] = old_ids + added_list
         clean_name = raw_name.replace(self.induce_suffix, "").strip()
@@ -1630,23 +1141,23 @@ class SteamToolbox:
         target_entry[1]['version'] = self._next_version(data)
         target_entry[1].setdefault('conflictResolutionMethod', 'custom')
         target_entry[1].setdefault('strMethodId', 'union-collections')
-        
+
         # 创建辅助收藏夹
         self._add_static_collection(data, f"{clean_name} - 比旧版多的", added_list)
         if removed_list:
             self._add_static_collection(data, f"{clean_name} - 比旧版少的", removed_list)
-            
+
         return len(added_list), len(removed_list), len(val_obj['added']), True
 
     def _perform_replace_update(self, data, target_entry, new_ids):
         """替换式更新：直接用新 ID 列表替换目标收藏夹的内容
-        
+
         Returns:
             (old_count, new_count)
         """
         val_obj = json.loads(target_entry[1]['value'])
         old_count = len(val_obj.get("added", []))
-        
+
         val_obj['added'] = new_ids
         clean_name = val_obj.get('name', '').replace(self.induce_suffix, "").strip()
         val_obj['name'] = f"{clean_name}{self.induce_suffix}"
@@ -1655,7 +1166,7 @@ class SteamToolbox:
         target_entry[1]['version'] = self._next_version(data)
         target_entry[1].setdefault('conflictResolutionMethod', 'custom')
         target_entry[1].setdefault('strMethodId', 'union-collections')
-        
+
         return old_count, len(new_ids)
 
     # --- 收藏夹导出/导入（两种格式） ---
@@ -4225,6 +3736,4 @@ class SteamToolbox:
         root.mainloop()
 
 
-if __name__ == "__main__":
-    app = SteamToolbox()
-    app.main_ui()
+

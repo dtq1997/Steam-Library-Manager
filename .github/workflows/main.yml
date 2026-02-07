@@ -27,11 +27,11 @@ jobs:
 
     - name: Windows 打包指令
       if: matrix.os == 'windows-latest'
-      run: python -m PyInstaller --noconsole --onefile --name="Steam库管理助手" Steam_Library_Manager.py
+      run: python -m PyInstaller --noconsole --onefile --name="Steam库管理助手" main.py
 
     - name: MacOS 打包指令
       if: matrix.os == 'macos-latest'
-      run: python3 -m PyInstaller --noconsole --onefile --windowed --name="Steam库管理助手" Steam_Library_Manager.py
+      run: python3 -m PyInstaller --noconsole --onefile --windowed --name="Steam库管理助手" main.py
 
     - name: 保存打包结果 (Windows)
       if: matrix.os == 'windows-latest'
