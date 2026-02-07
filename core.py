@@ -73,7 +73,6 @@ import base64
 import platform
 import shutil
 from datetime import datetime
-from pathlib import Path
 from steam_collection_manager import BackupManager
 from steam_account_manager import SteamAccountScanner
 
