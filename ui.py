@@ -1,25 +1,22 @@
 import json
-import time
-import secrets
 import os
-import sys
-import re
-import subprocess
-import webbrowser
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk, simpledialog
-import threading
-import ssl
-import urllib.request
-import urllib.error
-import base64
 import platform
-import shutil
+import re
+import secrets
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+import urllib.error
+import urllib.request
+import webbrowser
 from datetime import datetime
+from tkinter import filedialog, messagebox, ttk, simpledialog
 
 from core import SteamToolboxCore
-from steam_collection_manager import BackupManager
 from steam_account_manager import SteamAccountScanner
+
 
 class SteamToolbox:
     def __init__(self):
@@ -102,27 +99,7 @@ class SteamToolbox:
                   command=import_json, font=("微软雅黑", 9), width=32, height=3,
                   justify="left").pack(padx=20, pady=(0, 10))
 
-    @staticmethod
-    def protected_next_version(data):
-        """扫描全部条目，返回下一个可用的全局版本号（字符串）"""
-        max_ver = 0
-        for entry in data:
-            try:
-                v = int(entry[1].get("version", "0"))
-                if v > max_ver: max_ver = v
-            except (ValueError, IndexError, TypeError):
-                continue
-        return str(max_ver + 1)
 
-    def protected_add_static_collection(self, data, name, app_ids):
-        col_id = f"uc-{secrets.token_hex(6)}"
-        storage_key = f"user-collections.{col_id}"
-        val_obj = {"id": col_id, "name": name + self.induce_suffix, "added": app_ids, "removed": []}
-        new_entry = [storage_key, {"key": storage_key, "timestamp": int(time.time()),
-                                   "value": json.dumps(val_obj, ensure_ascii=False, separators=(',', ':')),
-                                   "version": self.protected_next_version(data),
-                                   "conflictResolutionMethod": "custom", "strMethodId": "union-collections"}]
-        data.append(new_entry)
 
     # --- 2. 批量导出 ---
     def export_static_collection(self):
@@ -489,7 +466,7 @@ class SteamToolbox:
                                   "setSuggestions": {}}}
         new_entry = [storage_key, {"key": storage_key, "timestamp": int(time.time()),
                                    "value": json.dumps(val_obj, ensure_ascii=False, separators=(',', ':')),
-                                   "version": self.protected_next_version(data),
+                                   "version": self.core.next_version(data),
                                    "conflictResolutionMethod": "custom", "strMethodId": "union-collections"}]
         data.append(new_entry)
 
@@ -734,7 +711,7 @@ class SteamToolbox:
             if not check_data(): return
             name = simpledialog.askstring("新建收藏夹", "请输入收藏夹名称：", initialvalue=fetched_name.get())
             if name:
-                self.protected_add_static_collection(data, name, list(fetched_ids))
+                self.core.add_static_collection(data, name, list(fetched_ids))
                 self.core.save_json(data, backup_description=f"从 Steam 列表创建收藏夹: {name}")
                 messagebox.showinfo("录入成功",
                                     f"已建立新收藏夹。本次共录入 {len(fetched_ids)} 个 AppID。" + self.disclaimer)

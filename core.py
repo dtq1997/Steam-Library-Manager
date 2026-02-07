@@ -6,7 +6,7 @@
 【确认机制】
 ※ 如果你（AI）已完整阅读本导言区，并同意严格按照以下所有规则执行，
   请在后续回复中首先向用户确认："已阅读导言区提示词，将严格按照规则执行。"
-  之后再进行具体的讨论或操作。
+  之后再进行具体地讨论或操作。
 
 【元规则 - 最高优先级】
 0. 【提示词协作】：允许 AI 根据与用户的交流情况，自发在本导言区增加或修改提示词，
@@ -135,6 +135,28 @@ class SteamToolboxCore:
                 except:
                     pass
 
+    @staticmethod
+    def next_version(data):
+        """扫描全部条目，返回下一个可用的全局版本号（字符串）"""
+        max_ver = 0
+        for entry in data:
+            try:
+                v = int(entry[1].get("version", "0"))
+                if v > max_ver: max_ver = v
+            except (ValueError, IndexError, TypeError):
+                continue
+        return str(max_ver + 1)
+
+    def add_static_collection(self, data, name, app_ids):
+        col_id = f"uc-{secrets.token_hex(6)}"
+        storage_key = f"user-collections.{col_id}"
+        val_obj = {"id": col_id, "name": name + self.induce_suffix, "added": app_ids, "removed": []}
+        new_entry = [storage_key, {"key": storage_key, "timestamp": int(time.time()),
+                                   "value": json.dumps(val_obj, ensure_ascii=False, separators=(',', ':')),
+                                   "version": self.protected_next_version(data),
+                                   "conflictResolutionMethod": "custom", "strMethodId": "union-collections"}]
+        data.append(new_entry)
+
     def load_config(self):
         """加载全局配置文件"""
         if os.path.exists(self.global_config_path):
@@ -214,7 +236,7 @@ class SteamToolboxCore:
 
     def get_igdb_access_token(self, force_refresh=False):
         """获取 IGDB API 的访问令牌（带缓存）"""
-        client_id, client_secret = self._get_igdb_credentials()
+        client_id, client_secret = self.get_igdb_credentials()
         if not client_id or not client_secret:
             return None, "未配置 IGDB API 凭证"
 
@@ -257,8 +279,8 @@ class SteamToolboxCore:
 
     def fetch_igdb_genres(self, progress_callback=None):
         """获取 IGDB 游戏类型列表"""
-        client_id, _ = self._get_igdb_credentials()
-        access_token, error = self._get_igdb_access_token()
+        client_id, _ = self.get_igdb_credentials()
+        access_token, error = self.get_igdb_access_token()
 
         if error:
             return [], error
@@ -302,7 +324,7 @@ class SteamToolboxCore:
 
     def load_igdb_cache(self):
         """加载 IGDB 缓存"""
-        path = self._get_igdb_cache_path()
+        path = self.get_igdb_cache_path()
         if os.path.exists(path):
             try:
                 with open(path, 'r', encoding='utf-8') as f:
@@ -313,7 +335,7 @@ class SteamToolboxCore:
 
     def save_igdb_cache(self, cache):
         """保存 IGDB 缓存"""
-        path = self._get_igdb_cache_path()
+        path = self.get_igdb_cache_path()
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(cache, f, ensure_ascii=False)
@@ -322,7 +344,7 @@ class SteamToolboxCore:
 
     def get_igdb_genre_cache(self, genre_id):
         """获取某个类型的缓存数据，返回 (steam_ids, cached_at_timestamp) 或 (None, None)"""
-        cache = self._load_igdb_cache()
+        cache = self.load_igdb_cache()
         genre_key = str(genre_id)
         if genre_key in cache:
             entry = cache[genre_key]
@@ -331,12 +353,12 @@ class SteamToolboxCore:
 
     def set_igdb_genre_cache(self, genre_id, steam_ids):
         """写入某个类型的缓存数据"""
-        cache = self._load_igdb_cache()
+        cache = self.load_igdb_cache()
         cache[str(genre_id)] = {
             "steam_ids": steam_ids,
             "cached_at": time.time(),
         }
-        self._save_igdb_cache(cache)
+        self.save_igdb_cache(cache)
 
     def is_igdb_cache_valid(self, cached_at):
         """判断缓存是否仍然有效"""
@@ -353,7 +375,7 @@ class SteamToolboxCore:
                    'is_full_dump': bool, 'total_steam_games': int}
                   如果无缓存则返回 None
         """
-        cache = self._load_igdb_cache()
+        cache = self.load_igdb_cache()
         if not cache:
             return None
 
@@ -381,7 +403,7 @@ class SteamToolboxCore:
 
     def clear_igdb_genre_cache(self):
         """清除所有 IGDB 缓存"""
-        path = self._get_igdb_cache_path()
+        path = self.get_igdb_cache_path()
         if os.path.exists(path):
             try:
                 os.remove(path)
@@ -422,8 +444,8 @@ class SteamToolboxCore:
         Returns:
             (genre_map, error): genre_map = {genre_id: [steam_app_ids]}, error = str | None
         """
-        client_id, _ = self._get_igdb_credentials()
-        access_token, error = self._get_igdb_access_token()
+        client_id, _ = self.get_igdb_credentials()
+        access_token, error = self.get_igdb_access_token()
         if error:
             return {}, error
 
@@ -440,7 +462,7 @@ class SteamToolboxCore:
 
         max_ext_id = 0
         body = "fields id; where external_game_source = 1; sort id desc; limit 1;"
-        results, err = self._igdb_api_request(
+        results, err = self.igdb_api_request(
             "https://api.igdb.com/v4/external_games", body, headers)
         if results:
             max_ext_id = results[0].get('id', 0)
@@ -467,7 +489,7 @@ class SteamToolboxCore:
                     f"where external_game_source = 1 & id > {last_id}; "
                     f"sort id asc; limit {limit};")
 
-            results, err = self._igdb_api_request(
+            results, err = self.igdb_api_request(
                 "https://api.igdb.com/v4/external_games", body, headers)
 
             if err:
@@ -515,7 +537,7 @@ class SteamToolboxCore:
                     f"where id = ({ids_str}); "
                     f"limit {limit};")
 
-            results, err = self._igdb_api_request(
+            results, err = self.igdb_api_request(
                 "https://api.igdb.com/v4/games", body, headers)
 
             if err:
@@ -547,7 +569,7 @@ class SteamToolboxCore:
             "total_steam_games": len(game_to_steam),
             "total_genres": len(genre_map),
         }
-        self._save_igdb_cache(cache)
+        self.save_igdb_cache(cache)
 
         if progress_callback:
             progress_callback(100, 100,
@@ -563,8 +585,8 @@ class SteamToolboxCore:
         """
         if not force_refresh:
             # 先检查该类型是否有缓存
-            cached_ids, cached_at = self._get_igdb_genre_cache(genre_id)
-            if cached_ids is not None and self._is_igdb_cache_valid(cached_at):
+            cached_ids, cached_at = self.get_igdb_genre_cache(genre_id)
+            if cached_ids is not None and self.is_igdb_cache_valid(cached_at):
                 if progress_callback:
                     age_hours = (time.time() - cached_at) / 3600
                     progress_callback(len(cached_ids), len(cached_ids),
@@ -573,9 +595,9 @@ class SteamToolboxCore:
                 return cached_ids, None
 
             # 该类型无缓存，但全量缓存可能已构建（只是该类型确实没有 Steam 游戏）
-            cache = self._load_igdb_cache()
+            cache = self.load_igdb_cache()
             meta = cache.get("_meta", {})
-            if meta.get("type") == "full_dump" and self._is_igdb_cache_valid(meta.get("cached_at", 0)):
+            if meta.get("type") == "full_dump" and self.is_igdb_cache_valid(meta.get("cached_at", 0)):
                 # 全量缓存有效，该类型确实无数据
                 if progress_callback:
                     age_hours = (time.time() - meta["cached_at"]) / 3600
@@ -587,7 +609,7 @@ class SteamToolboxCore:
         if progress_callback:
             progress_callback(0, 0, "本地数据不完整，正在从 IGDB 下载...", "首次下载约需 5-8 分钟")
 
-        genre_map, error = self._build_igdb_full_cache(progress_callback)
+        genre_map, error = self.build_igdb_full_cache(progress_callback)
         if error:
             return [], error
 
@@ -658,7 +680,7 @@ class SteamToolboxCore:
 
     def get_static_collections(self, data):
         """获取所有收藏夹（含动态）及其 entry 引用，按字母排序"""
-        return self._get_all_collections_with_refs(data)
+        return self.get_all_collections_with_refs(data)
 
     @staticmethod
     def get_all_collections_with_refs(data):
@@ -741,7 +763,7 @@ class SteamToolboxCore:
         """从 HTML 中智能提取页面名称（带类型前缀）"""
         type_name_cn = "列表"
         if url_hint:
-            page_type, _ = self._extract_steam_list_info(url_hint)
+            page_type, _ = self.extract_steam_list_info(url_hint)
             type_names = {
                 "curator": "鉴赏家",
                 "publisher": "发行商",
@@ -780,7 +802,7 @@ class SteamToolboxCore:
 
     def extract_curator_name(self, html_text):
         """从 HTML 中智能提取鉴赏家名称（保持向后兼容）"""
-        return self._extract_page_name_from_html(html_text)
+        return self.extract_page_name_from_html(html_text)
 
     @staticmethod
     def extract_steam_list_info(url_or_id):
@@ -827,10 +849,10 @@ class SteamToolboxCore:
             cookies = base_cookies
 
         if page_type in ("curator", "publisher", "developer"):
-            return self._fetch_curator_style_api(page_type, identifier, type_name_cn, cookies, has_login,
+            return self.fetch_curator_style_api(page_type, identifier, type_name_cn, cookies, has_login,
                                                  progress_callback)
         else:
-            return self._fetch_generic_list(page_type, identifier, type_name_cn, cookies, has_login, progress_callback)
+            return self.fetch_generic_list(page_type, identifier, type_name_cn, cookies, has_login, progress_callback)
 
     def fetch_curator_style_api(self, page_type, identifier, type_name_cn, cookies, has_login, progress_callback=None):
         """统一的 ajaxgetfilteredrecommendations API 抓取"""
@@ -1059,7 +1081,7 @@ class SteamToolboxCore:
             if not page_name:
                 page_name = unquote(identifier).replace('%20', ' ').replace('+', ' ')
 
-            ids = self._extract_ids_from_html(html_content)
+            ids = self.extract_ids_from_html(html_content)
             for aid in ids:
                 all_unique_ids.add(aid)
 
@@ -1079,7 +1101,7 @@ class SteamToolboxCore:
                     with urllib.request.urlopen(req, timeout=15, context=self.ssl_context) as resp:
                         page_html = resp.read().decode('utf-8')
 
-                    page_ids = self._extract_ids_from_html(page_html)
+                    page_ids = self.extract_ids_from_html(page_html)
                     if not page_ids or all(aid in all_unique_ids for aid in page_ids):
                         break
 
@@ -1152,9 +1174,9 @@ class SteamToolboxCore:
         target_entry[1].setdefault('strMethodId', 'union-collections')
 
         # 创建辅助收藏夹
-        self._add_static_collection(data, f"{clean_name} - 比旧版多的", added_list)
+        self.add_static_collection(data, f"{clean_name} - 比旧版多的", added_list)
         if removed_list:
-            self._add_static_collection(data, f"{clean_name} - 比旧版少的", removed_list)
+            self.add_static_collection(data, f"{clean_name} - 比旧版少的", removed_list)
 
         return len(added_list), len(removed_list), len(val_obj['added']), True
 
@@ -1172,7 +1194,7 @@ class SteamToolboxCore:
         val_obj['name'] = f"{clean_name}{self.induce_suffix}"
         target_entry[1]['value'] = json.dumps(val_obj, ensure_ascii=False, separators=(',', ':'))
         target_entry[1]['timestamp'] = int(time.time())
-        target_entry[1]['version'] = self._next_version(data)
+        target_entry[1]['version'] = self.next_version(data)
         target_entry[1].setdefault('conflictResolutionMethod', 'custom')
         target_entry[1].setdefault('strMethodId', 'union-collections')
 
@@ -1222,7 +1244,7 @@ class SteamToolboxCore:
             app_ids = [int(line.strip()) for line in f if line.strip().isdigit()]
         if not app_ids:
             return None, "文件中没有有效的 AppID。"
-        self._add_static_collection(data, file_title, app_ids)
+        self.add_static_collection(data, file_title, app_ids)
         return len(app_ids), None
 
     def import_collections_structured(self, file_path, data):
@@ -1259,14 +1281,14 @@ class SteamToolboxCore:
                     "key": storage_key,
                     "timestamp": int(time.time()),
                     "value": json.dumps(val_obj, ensure_ascii=False, separators=(',', ':')),
-                    "version": self._next_version(data),
+                    "version": self.next_version(data),
                     "conflictResolutionMethod": "custom",
                     "strMethodId": "union-collections"
                 }]
                 data.append(new_entry)
             else:
                 # 静态收藏夹
-                self._add_static_collection(data, name.replace(self.induce_suffix, "").strip(), added)
+                self.add_static_collection(data, name.replace(self.induce_suffix, "").strip(), added)
             count += 1
 
         return count, None
