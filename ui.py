@@ -47,7 +47,7 @@ class SteamToolbox:
         def import_txt():
             fmt_win.destroy()
             paths = filedialog.askopenfilenames(
-                initialdir=self.corecurrent_dir, title="选择 AppID 列表文件（TXT）",
+                initialdir=self.core.current_dir, title="选择 AppID 列表文件（TXT）",
                 filetypes=[("Text files", "*.txt")])
             if not paths:
                 return
@@ -72,7 +72,7 @@ class SteamToolbox:
         def import_json():
             fmt_win.destroy()
             path = filedialog.askopenfilename(
-                initialdir=self.corecurrent_dir, title="选择结构化收藏夹文件（JSON）",
+                initialdir=self.core.current_dir, title="选择结构化收藏夹文件（JSON）",
                 filetypes=[("JSON files", "*.json")])
             if not path:
                 return
@@ -147,7 +147,7 @@ class SteamToolbox:
                 messagebox.showwarning("提示", "选中的收藏夹没有可导出的 AppID。")
                 return
             save_path = filedialog.asksaveasfilename(
-                initialdir=self.corecurrent_dir, title="保存合并 AppID 列表",
+                initialdir=self.core.current_dir, title="保存合并 AppID 列表",
                 defaultextension=".txt", initialfile="merged_appids.txt",
                 filetypes=[("Text files", "*.txt")])
             if save_path:
@@ -159,7 +159,7 @@ class SteamToolbox:
 
         def export_multiple_txt():
             fmt_win.destroy()
-            dest_dir = filedialog.askdirectory(initialdir=self.corecurrent_dir, title="选择保存导出文件的文件夹")
+            dest_dir = filedialog.askdirectory(initialdir=self.core.current_dir, title="选择保存导出文件的文件夹")
             if not dest_dir:
                 return
             count = 0
@@ -180,7 +180,7 @@ class SteamToolbox:
             fmt_win.destroy()
             export_data = self.core.export_collections_structured(selected)
             save_path = filedialog.asksaveasfilename(
-                initialdir=self.corecurrent_dir, title="保存收藏夹结构化数据",
+                initialdir=self.core.current_dir, title="保存收藏夹结构化数据",
                 defaultextension=".json", initialfile="exported_collections.json",
                 filetypes=[("JSON files", "*.json")])
             if save_path:
@@ -213,7 +213,7 @@ class SteamToolbox:
         def update_from_txt():
             fmt_win.destroy()
             txt_paths = filedialog.askopenfilenames(
-                initialdir=self.corecurrent_dir, title="选择 AppID 列表 (TXT)",
+                initialdir=self.core.current_dir, title="选择 AppID 列表 (TXT)",
                 filetypes=[("Text files", "*.txt")])
             if not txt_paths:
                 return
@@ -244,7 +244,7 @@ class SteamToolbox:
         def update_from_json():
             fmt_win.destroy()
             path = filedialog.askopenfilename(
-                initialdir=self.corecurrent_dir, title="选择结构化收藏夹文件（JSON）",
+                initialdir=self.core.current_dir, title="选择结构化收藏夹文件（JSON）",
                 filetypes=[("JSON files", "*.json")])
             if not path:
                 return
@@ -745,7 +745,7 @@ class SteamToolbox:
             name = simpledialog.askstring("导出设置", "请输入生成的 TXT 文件名：",
                                           initialvalue=self.core.sanitize_filename(fetched_name.get()))
             if not name: return
-            save_path = filedialog.asksaveasfilename(initialdir=self.corecurrent_dir, title="保存 AppID 列表",
+            save_path = filedialog.asksaveasfilename(initialdir=self.core.current_dir, title="保存 AppID 列表",
                                                      defaultextension=".txt",
                                                      initialfile=f"{self.core.sanitize_filename(name)}.txt",
                                                      filetypes=[("Text files", "*.txt")])
@@ -1440,7 +1440,7 @@ class SteamToolbox:
 
         def do_export():
             # 先选择目录，再获取数据
-            dest_dir = filedialog.askdirectory(initialdir=self.corecurrent_dir, title="选择保存文件夹")
+            dest_dir = filedialog.askdirectory(initialdir=self.core.current_dir, title="选择保存文件夹")
             if not dest_dir:
                 return
 
@@ -1518,7 +1518,7 @@ class SteamToolbox:
         def do_select_files():
             nonlocal merged_ids, merge_stats
             file_paths = filedialog.askopenfilenames(
-                initialdir=self.corecurrent_dir, title="选择 SteamDB 源代码文件 (可多选)",
+                initialdir=self.core.current_dir, title="选择 SteamDB 源代码文件 (可多选)",
                 filetypes=[("HTML files", "*.html"), ("Text files", "*.txt"), ("All files", "*.*")]
             )
             if not file_paths: return
@@ -1575,7 +1575,7 @@ class SteamToolbox:
             name = simpledialog.askstring("导出设置", "请输入生成的 TXT 文件名：",
                                           initialvalue=self.core.sanitize_filename(name_var.get()))
             if not name: return
-            save_path = filedialog.asksaveasfilename(initialdir=self.corecurrent_dir, title="保存 AppID 列表",
+            save_path = filedialog.asksaveasfilename(initialdir=self.core.current_dir, title="保存 AppID 列表",
                                                      defaultextension=".txt",
                                                      initialfile=f"{self.core.sanitize_filename(name)}.txt",
                                                      filetypes=[("Text files", "*.txt")])
