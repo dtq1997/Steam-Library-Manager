@@ -602,6 +602,7 @@ class SteamToolboxCore:
                     pass
             return False
 
+
     @staticmethod
     def sanitize_filename(name):
         """清洗文件名，替换系统禁止的特殊字符"""
