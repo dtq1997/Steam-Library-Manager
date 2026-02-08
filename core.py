@@ -1,60 +1,3 @@
-"""
-================================================================================
-【AI 协作系统提示词 / System Prompt for AI Maintainers】
-如果你（AI）正在处理此文件，请务必遵守以下开发者习惯与规则：
-
-【确认机制】
-※ 如果你（AI）已完整阅读本导言区，并同意严格按照以下所有规则执行，
-  请在后续回复中首先向用户确认："已阅读导言区提示词，将严格按照规则执行。"
-  之后再进行具体地讨论或操作。
-
-【元规则 - 最高优先级】
-0. 【提示词协作】：允许 AI 根据与用户的交流情况，自发在本导言区增加或修改提示词，
-   但每次增加或修改提示词前必须先与用户讨论并获得同意。
-   AI 必须严格遵照本导言区的所有提示词运作，本导言区规则优先级最高。
-   【主动更新】：如果用户提出的需求反映了某些更具一般性的要求，AI 应主动将其整合
-   为新的规则添加到本导言区，并在回复中明确告知用户具体修改了哪些内容。
-
-【开发规范】
-1. 【逻辑稳定性】：核心功能（JSON 读写、AppID 正则提取）严禁在非必要情况下改动。
-2. 【改动确认】：在尝试重构现有功能或大规模调整 UI 前，必须获得用户明确许可。
-3. 【更新逻辑】：更新功能（无论是 TXT 还是鉴赏家）必须采用"增量"模式：
-   - 主收藏夹：原有 ID + 新增 ID（去重）。
-   - 必须创建两个辅助收藏夹："[原名] - 比旧版多的" 和 "[原名] - 比旧版少的"。
-   - 【无新增时跳过】：如果更新后没有新增任何游戏，应提示"该列表已是最新"，
-     不执行任何操作（不修改主收藏夹、不创建辅助收藏夹）。
-4. 【命名规范】：所有通过程序创建或更新的收藏夹名称必须强制添加后缀："(删除这段字以触发云同步)"。
-5. 【UI 习惯】：功能按钮的排列顺序保持为：[导入]、[导出]、[更新]。
-6. 【反馈机制】：操作完成后必须显示录入/差异数量，并附带数目对不上的免责注记。
-7. 【UI 文本风格】：
-   - 窗口标题：动宾结构，如"同步 Steam 鉴赏家游戏列表"
-   - 使用指南：格式为"使用指南：\n1. xxx\n2. xxx"
-   - 状态反馈：✅ 表示成功，❌ 表示失败
-   - 按钮文字：emoji + 动宾结构，如"📁 建立为新收藏夹"
-   - 说明列表：使用"• "开头
-   - 关键信息：使用红色高亮
-   - 保持简洁，避免冗余描述
-8. 【网络请求】：macOS 需禁用 SSL 证书验证以解决证书问题。
-9. 【备份机制】：修改原文件前必须先创建备份，备份存储在 json 同目录的 backups/ 文件夹中。
-10.【账号管理】：程序启动时自动扫描所有 Steam 账号，支持多账号切换，始终高亮当前账号。
-11.【窗口大小】：所有窗口必须自适应内容大小，禁止使用固定的 geometry() 设置窗口尺寸。
-12.【全局配置】：需要跨功能共享的配置项（如 Cookie）应在主界面提供统一的管理入口，
-   并在所有相关子功能中全局调用。子功能界面应显示该配置项的当前状态，
-   并说明配置后的效果。
-13.【主界面布局规范】：主界面采用紧凑布局，减少不必要的空间浪费，具体要求如下：
-   a) 【收藏夹列表置左】：收藏夹列表（"📂 当前收藏夹"面板）必须放在程序主界面的
-      最左侧，与 Steam 客户端的侧边栏风格保持一致。功能控制区在右侧。
-   b) 【备份管理就近放置】："💾 管理收藏夹备份"按钮应放置在"📂 当前收藏夹"标题
-      旁边（同一行），而不是作为独立的大按钮占据一整行。这样既节省空间又语义自然。
-   c) 【配置按钮并排】："🔑 管理登录态 Cookie" 和 "🎮 管理 IGDB API 凭证" 两个
-      按钮必须并排放置在同一行，而不是各自独占一行。
-   d) 【整体紧凑】：避免按钮独占整行、说明文字过多导致界面冗长的情况。
-      功能说明应尽量精简，能合并的按钮尽量合并在同一行。
-14.【增量修改】：生成代码时必须基于现有代码进行增量修改，严禁重新生成整个文件或整个方法。
-   应只输出需要变动的部分（如使用 diff/patch 或明确标注修改区域），以节省 token 开销。
-================================================================================
-"""
-
 import base64
 import json
 import os
@@ -66,9 +9,11 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime
+from json import JSONDecodeError
 from tkinter import messagebox
 
-from steam_collection_manager import BackupManager
+from account_manager import SteamAccount
+from local_storage import BackupManager
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -80,15 +25,11 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 class SteamToolboxCore:
     """核心类，UI 无关"""
 
-    def __init__(self):
-        self.current_account = None  # 当前选中的账号
-        self.accounts = []  # 所有扫描到的账号
-        self.backup_manager = None  # 备份管理器
+    def __init__(self, account: SteamAccount):
+        self.current_account: SteamAccount = account  # 当前选中的账号
 
         # 这些属性会在选择账号后设置
-        self.json_path = None
-        self.json_name = "cloud-storage-namespace-1.json"
-        self.current_dir = None
+        self.backup_manager = BackupManager(self.current_account.storage_path)  # 备份管理器
 
         # 数据目录（统一存放配置和缓存）
         self.data_dir = os.path.join(os.path.expanduser("~"), ".steam_toolbox")
@@ -106,12 +47,6 @@ class SteamToolboxCore:
         self.ssl_context.check_hostname = False
         self.ssl_context.verify_mode = ssl.CERT_NONE
 
-    def set_current_account(self, account):
-        """设置当前账号"""
-        self.current_account = account
-        self.json_path = account['json_path']
-        self.current_dir = os.path.dirname(self.json_path)
-        self.backup_manager = BackupManager(self.json_path)
 
     def migrate_old_files(self):
         """将旧版散落在主目录的文件迁移到统一数据目录"""
@@ -612,11 +547,11 @@ class SteamToolboxCore:
         return steam_ids, None
 
     def load_json(self):
-        if not self.json_path or not os.path.exists(self.json_path):
-            messagebox.showerror("错误", f"找不到 {self.json_name}\n请确保已选择有效的 Steam 账号。")
+        if not self.current_account.storage_path or not os.path.exists(self.current_account.storage_path):
+            messagebox.showerror("错误", f"读取文件失败，请确保已选择有效的 Steam 账号。")
             return None
         try:
-            with open(self.json_path, 'r', encoding='utf-8') as f:
+            with open(self.current_account.storage_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
             messagebox.showerror("读取错误", f"解析失败: {e}")
@@ -630,7 +565,7 @@ class SteamToolboxCore:
             create_backup: 是否在保存前创建备份
             backup_description: 备份描述
         """
-        if not self.json_path:
+        if not self.current_account.storage_path:
             messagebox.showerror("错误", "未选择账号，无法保存。")
             return False
 
@@ -645,18 +580,18 @@ class SteamToolboxCore:
             backup_info = ""
 
         # 写入原文件（使用原子写入）
-        tmp_path = self.json_path + ".tmp"
+        tmp_path = self.current_account.storage_path + ".tmp"
         try:
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
 
             # 原子替换
-            if os.path.exists(self.json_path):
-                os.replace(tmp_path, self.json_path)
+            if os.path.exists(self.current_account.storage_path):
+                os.replace(tmp_path, self.current_account.storage_path)
             else:
-                os.rename(tmp_path, self.json_path)
+                os.rename(tmp_path, self.current_account.storage_path)
 
-            messagebox.showinfo("成功", f"文件已保存：\n{os.path.basename(self.json_path)}{backup_info}")
+            messagebox.showinfo("成功", f"文件已保存：\n{os.path.basename(self.current_account.storage_path)}{backup_info}")
             return True
         except Exception as e:
             messagebox.showerror("保存失败", f"无法写入文件: {e}")
@@ -1243,8 +1178,11 @@ class SteamToolboxCore:
 
     def import_collections_structured(self, file_path, data):
         """格式二：导入结构化 JSON 文件，还原多个收藏夹（含动态逻辑）"""
-        with open(file_path, 'r', encoding='utf-8') as f:
-            import_data = json.load(f)
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                import_data = json.load(f)
+        except JSONDecodeError as e:
+            return None, "文件不是有效的 JSON 格式。"
 
         if import_data.get("format") != "steam_collections_structured":
             return None, "文件格式不匹配：缺少 format 标识。"
@@ -1286,3 +1224,60 @@ class SteamToolboxCore:
             count += 1
 
         return count, None
+
+    def add_dynamic_collection(self, data, name, friend_code):
+        col_id = f"uc-{secrets.token_hex(4)}"
+        storage_key = f"user-collections.{col_id}"
+        filter_groups = [{"rgOptions": [], "bAcceptUnion": False} for _ in range(9)]
+        filter_groups[0]["bAcceptUnion"] = True
+        filter_groups[6]["rgOptions"] = [int(friend_code)]
+        val_obj = {"id": col_id, "name": name + self.induce_suffix, "added": [], "removed": [],
+                   "filterSpec": {"nFormatVersion": 2, "strSearchText": "", "filterGroups": filter_groups,
+                                  "setSuggestions": {}}}
+        new_entry = [storage_key, {"key": storage_key, "timestamp": int(time.time()),
+                                   "value": json.dumps(val_obj, ensure_ascii=False, separators=(',', ':')),
+                                   "version": self.next_version(data),
+                                   "conflictResolutionMethod": "custom", "strMethodId": "union-collections"}]
+        data.append(new_entry)
+
+    def fetch_steam250_ids(self, url, progress_callback=None):
+        """从 Steam250 页面提取 AppID 列表"""
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
+        }
+
+        if progress_callback:
+            progress_callback(0, 0, "正在连接 Steam250...", "")
+
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=20, context=self.ssl_context) as resp:
+                html_content = resp.read().decode('utf-8')
+
+            if progress_callback:
+                progress_callback(0, 0, "正在解析页面...", "")
+
+            raw_ids = re.findall(r'store\.steampowered\.com/app/(\d+)', html_content)
+
+            unique_ids = []
+            for aid in raw_ids:
+                if aid not in unique_ids:
+                    unique_ids.append(aid)
+
+            app_ids = [int(aid) for aid in unique_ids[:250]]
+
+            if not app_ids:
+                return [], "未能从页面提取到任何 AppID。页面结构可能已变化。"
+
+            return app_ids, None
+
+        except urllib.error.HTTPError as e:
+            return [], f"HTTP 错误 {e.code}：无法访问 Steam250。"
+        except urllib.error.URLError as e:
+            return [], f"网络错误：{str(e.reason)}"
+        except Exception as e:
+            return [], f"提取失败：{str(e)}"
+
+

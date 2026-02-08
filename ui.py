@@ -2,27 +2,25 @@ import json
 import os
 import platform
 import re
-import secrets
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
-import urllib.error
-import urllib.request
 import webbrowser
 from datetime import datetime
 from tkinter import filedialog, messagebox, ttk, simpledialog
+from typing import Callable
 
+from account_manager import SteamDiscovery, SteamAccount
 from core import SteamToolboxCore
-from steam_account_manager import SteamAccountScanner
 
 
 class SteamToolbox:
-    def __init__(self):
-        
-        self.core = SteamToolboxCore()
-        
+    def __init__(self, account: SteamAccount, back_to_select_callback: Callable):
+        self.core = SteamToolboxCore(account)
+        self.back_to_select_callback = back_to_select_callback
+
         # ---
 
         self.induce_suffix = "(删除这段字以触发云同步)"
@@ -31,75 +29,46 @@ class SteamToolbox:
     
     # --- 1. 批量导入 ---
 
-    def import_from_txt(self):
+    def import_collection(self):
         """批量导入：选择 TXT（多个 AppID 列表）或 JSON（结构化收藏夹）"""
-        fmt_win = tk.Toplevel()
-        fmt_win.title("批量导入收藏夹")
-        fmt_win.attributes("-topmost", True)
-        fmt_win.resizable(False, False)
+        paths = filedialog.askopenfilenames(
+            initialdir=os.path.expanduser('~'),
+            title="选择文件",
+            filetypes=[("文本 AppID 列表", "*.txt"), ("JSON 结构化收藏夹", "*.json")])
 
-        tk.Label(fmt_win, text="请选择要导入的文件格式：",
-                 font=("微软雅黑", 10), pady=10).pack(padx=20)
+        if not paths:
+            return
 
-        def import_txt():
-            fmt_win.destroy()
-            paths = filedialog.askopenfilenames(
-                initialdir=self.core.current_dir, title="选择 AppID 列表文件（TXT）",
-                filetypes=[("Text files", "*.txt")])
-            if not paths:
-                return
-            data = self.core.load_json()
-            if data is None:
-                return
-            existing = self.core.get_all_collections_ordered(data)
-            self._original_col_ids = {c['id'] for c in existing}
-            results = []
-            for p in paths:
-                count, err = self.core.import_collections_appid_list(p, data)
-                fname = os.path.basename(p)
-                if err:
-                    results.append(f"❌ {fname}: {err}")
-                else:
-                    results.append(f"✅ {fname}: {count} 个 AppID")
-            self._ui_mark_dirty(data)
-            self._ui_refresh()
-            messagebox.showinfo("导入完成",
-                                "导入结果：\n" + "\n".join(results) + "\n\n请点击「💾 储存更改」写入文件。")
+        data = self.core.load_json()
 
-        def import_json():
-            fmt_win.destroy()
-            path = filedialog.askopenfilename(
-                initialdir=self.core.current_dir, title="选择结构化收藏夹文件（JSON）",
-                filetypes=[("JSON files", "*.json")])
-            if not path:
-                return
-            data = self.core.load_json()
-            if data is None:
-                return
-            existing = self.core.get_all_collections_ordered(data)
-            self._original_col_ids = {c['id'] for c in existing}
+        if data is None:
+            return
+
+        existing = self.core.get_all_collections_ordered(data)
+        self._original_col_ids = {c['id'] for c in existing}
+
+        import_echo = [""]
+
+        for path in paths:
+            filename = os.path.basename(path)
             try:
-                count, err = self.core.import_collections_structured(path, data)
-                if err:
-                    messagebox.showerror("导入失败", err)
-                    return
-                self._ui_mark_dirty(data)
-                self._ui_refresh()
-                messagebox.showinfo("导入完成",
-                                    f"✅ 已导入 {count} 个收藏夹。\n\n请点击「💾 储存更改」写入文件。")
-            except json.JSONDecodeError:
-                messagebox.showerror("导入失败", "文件不是有效的 JSON 格式。")
+                ext = os.path.splitext(path)[1].lower()
+                if ext == ".txt":
+                    count, err = self.core.import_collections_appid_list(path, data)
+                elif ext == ".json":
+                    count, err = self.core.import_collections_structured(path, data)
+                else:
+                    count, err = 0, "不支持的文件格式。" # unreachable, for coverage
             except Exception as e:
-                messagebox.showerror("导入失败", f"导入时出错：{e}")
-
-        tk.Button(fmt_win, text="📄 导入 AppID 列表（TXT）\n文件名将成为收藏夹名称",
-                  command=import_txt, font=("微软雅黑", 9), width=32, height=3,
-                  justify="left").pack(padx=20, pady=(5, 5))
-        tk.Button(fmt_win, text="📦 导入结构化数据（JSON）\n还原收藏夹名称及动态逻辑",
-                  command=import_json, font=("微软雅黑", 9), width=32, height=3,
-                  justify="left").pack(padx=20, pady=(0, 10))
-
-
+                import_echo.append(f"❌ {filename}: {e}")
+            else:
+                if err:
+                    import_echo.append(f"❌ {filename}: {err}")
+                else:
+                    import_echo.append(f"✅ {filename}: {count} 个 AppID。")
+        self._ui_mark_dirty(data)
+        self._ui_refresh()
+        messagebox.showinfo("导入完成", f"导入结果：{"\n".join(import_echo)}\n\n最后请点击「💾 储存更改」写入文件。")
 
     # --- 2. 批量导出 ---
     def export_static_collection(self):
@@ -124,7 +93,7 @@ class SteamToolbox:
                 messagebox.showwarning("提示", "选中的收藏夹没有可导出的 AppID。")
                 return
             save_path = filedialog.asksaveasfilename(
-                initialdir=self.core.current_dir, title="保存合并 AppID 列表",
+                initialdir=os.path.expanduser('~'), title="保存合并 AppID 列表",
                 defaultextension=".txt", initialfile="merged_appids.txt",
                 filetypes=[("Text files", "*.txt")])
             if save_path:
@@ -136,7 +105,7 @@ class SteamToolbox:
 
         def export_multiple_txt():
             fmt_win.destroy()
-            dest_dir = filedialog.askdirectory(initialdir=self.core.current_dir, title="选择保存导出文件的文件夹")
+            dest_dir = filedialog.askdirectory(initialdir=os.path.expanduser('~'), title="选择保存导出文件的文件夹")
             if not dest_dir:
                 return
             count = 0
@@ -157,7 +126,7 @@ class SteamToolbox:
             fmt_win.destroy()
             export_data = self.core.export_collections_structured(selected)
             save_path = filedialog.asksaveasfilename(
-                initialdir=self.core.current_dir, title="保存收藏夹结构化数据",
+                initialdir=os.path.expanduser('~'), title="保存收藏夹结构化数据",
                 defaultextension=".json", initialfile="exported_collections.json",
                 filetypes=[("JSON files", "*.json")])
             if save_path:
@@ -190,7 +159,7 @@ class SteamToolbox:
         def update_from_txt():
             fmt_win.destroy()
             txt_paths = filedialog.askopenfilenames(
-                initialdir=self.core.current_dir, title="选择 AppID 列表 (TXT)",
+                initialdir=os.path.expanduser('~'), title="选择 AppID 列表 (TXT)",
                 filetypes=[("Text files", "*.txt")])
             if not txt_paths:
                 return
@@ -216,12 +185,12 @@ class SteamToolbox:
                 self._ui_mark_dirty(data)
                 self._ui_refresh()
 
-            self.protected_show_batch_update_mapping(data, all_cols, sources, on_done)
+            self.show_batch_update_mapping(data, all_cols, sources, on_done)
 
         def update_from_json():
             fmt_win.destroy()
             path = filedialog.askopenfilename(
-                initialdir=self.core.current_dir, title="选择结构化收藏夹文件（JSON）",
+                initialdir=os.path.expanduser('~'), title="选择结构化收藏夹文件（JSON）",
                 filetypes=[("JSON files", "*.json")])
             if not path:
                 return
@@ -262,7 +231,7 @@ class SteamToolbox:
                 self._ui_mark_dirty(data)
                 self._ui_refresh()
 
-            self.protected_show_batch_update_mapping(data, all_cols, sources, on_done)
+            self.show_batch_update_mapping(data, all_cols, sources, on_done)
 
         tk.Button(fmt_win, text="📄 从 TXT 文件更新\n选择多个 AppID 列表文件",
                   command=update_from_txt, font=("微软雅黑", 9), width=32, height=3,
@@ -271,7 +240,7 @@ class SteamToolbox:
                   command=update_from_json, font=("微软雅黑", 9), width=32, height=3,
                   justify="left").pack(padx=20, pady=(0, 10))
 
-    def protected_show_batch_update_mapping(self, data, all_cols, sources, on_done, parent_to_close=None,
+    def show_batch_update_mapping(self, data, all_cols, sources, on_done, parent_to_close=None,
                                             saved_mappings_key=None):
         """通用的批量更新映射界面：一屏选择所有来源到目标收藏夹+更新模式"""
         up_win = tk.Toplevel()
@@ -419,7 +388,7 @@ class SteamToolbox:
     def protected_show_update_target_dialog(self, data, all_cols, new_ids, source_name, index, total, on_next):
         """单来源更新的快捷入口，内部调用 _show_batch_update_mapping"""
         sources = {source_name: {"name": source_name, "ids": new_ids}}
-        self.protected_show_batch_update_mapping(data, all_cols, sources, on_next)
+        self.show_batch_update_mapping(data, all_cols, sources, on_next)
 
     # --- 4. 动态好友同步 ---
     def open_friend_sync_ui(self):
@@ -446,7 +415,7 @@ class SteamToolbox:
             names = [n.strip() for n in names_text.get("1.0", "end").strip().split('\n') if n.strip()]
             for i, cid in enumerate(codes):
                 cname = names[i] if i < len(names) else f"好友代码 [{cid}]"
-                self.protected_add_dynamic_collection(data, cname, cid)
+                self.core.add_dynamic_collection(data, cname, cid)
             if codes: self.core.save_json(data, backup_description="同步好友游戏库"); sync_win.destroy()
 
         btn_frame = tk.Frame(sync_win)
@@ -454,21 +423,6 @@ class SteamToolbox:
         tk.Button(btn_frame, text="✨ 生成默认名称", command=generate_default_names, width=18, height=2).pack(
             side="left", padx=10)
         tk.Button(btn_frame, text="开始导入", command=commit_import, width=18, height=2).pack(side="left", padx=10)
-
-    def protected_add_dynamic_collection(self, data, name, friend_code):
-        col_id = f"uc-{secrets.token_hex(4)}"
-        storage_key = f"user-collections.{col_id}"
-        filter_groups = [{"rgOptions": [], "bAcceptUnion": False} for _ in range(9)]
-        filter_groups[0]["bAcceptUnion"] = True
-        filter_groups[6]["rgOptions"] = [int(friend_code)]
-        val_obj = {"id": col_id, "name": name + self.induce_suffix, "added": [], "removed": [],
-                   "filterSpec": {"nFormatVersion": 2, "strSearchText": "", "filterGroups": filter_groups,
-                                  "setSuggestions": {}}}
-        new_entry = [storage_key, {"key": storage_key, "timestamp": int(time.time()),
-                                   "value": json.dumps(val_obj, ensure_ascii=False, separators=(',', ':')),
-                                   "version": self.core.next_version(data),
-                                   "conflictResolutionMethod": "custom", "strMethodId": "union-collections"}]
-        data.append(new_entry)
 
     # --- 5. 选择来源入口 ---
     def open_source_selection(self):
@@ -722,7 +676,7 @@ class SteamToolbox:
             name = simpledialog.askstring("导出设置", "请输入生成的 TXT 文件名：",
                                           initialvalue=self.core.sanitize_filename(fetched_name.get()))
             if not name: return
-            save_path = filedialog.asksaveasfilename(initialdir=self.core.current_dir, title="保存 AppID 列表",
+            save_path = filedialog.asksaveasfilename(initialdir=os.path.expanduser('~'), title="保存 AppID 列表",
                                                      defaultextension=".txt",
                                                      initialfile=f"{self.core.sanitize_filename(name)}.txt",
                                                      filetypes=[("Text files", "*.txt")])
@@ -744,52 +698,14 @@ class SteamToolbox:
                 self.core.save_json(data, backup_description=f"从 Steam 列表更新收藏夹")
                 cur_win.destroy()
 
-            self.protected_show_batch_update_mapping(data, all_cols, sources, on_done, parent_to_close=cur_win)
+            self.show_batch_update_mapping(data, all_cols, sources, on_done, parent_to_close=cur_win)
 
         tk.Button(btn_frame, text="📁 建立为新收藏夹", command=do_create, width=15).pack(side="left", padx=5)
         tk.Button(btn_frame, text="📥 导出为 TXT 文件", command=do_export, width=18).pack(side="left", padx=5)
         tk.Button(btn_frame, text="🔄️ 更新现有收藏夹", command=do_update, width=15).pack(side="left", padx=5)
 
     # --- 个人推荐分类界面（Steam250 + 鉴赏家精选） ---
-    def protected_fetch_steam250_ids(self, url, progress_callback=None):
-        """从 Steam250 页面提取 AppID 列表"""
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
-        }
 
-        if progress_callback:
-            progress_callback(0, 0, "正在连接 Steam250...", "")
-
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=20, context=self.core.ssl_context) as resp:
-                html_content = resp.read().decode('utf-8')
-
-            if progress_callback:
-                progress_callback(0, 0, "正在解析页面...", "")
-
-            raw_ids = re.findall(r'store\.steampowered\.com/app/(\d+)', html_content)
-
-            unique_ids = []
-            for aid in raw_ids:
-                if aid not in unique_ids:
-                    unique_ids.append(aid)
-
-            app_ids = [int(aid) for aid in unique_ids[:250]]
-
-            if not app_ids:
-                return [], "未能从页面提取到任何 AppID。页面结构可能已变化。"
-
-            return app_ids, None
-
-        except urllib.error.HTTPError as e:
-            return [], f"HTTP 错误 {e.code}：无法访问 Steam250。"
-        except urllib.error.URLError as e:
-            return [], f"网络错误：{str(e.reason)}"
-        except Exception as e:
-            return [], f"提取失败：{str(e)}"
 
     def personal_recommend_ui(self):
         """个人推荐分类界面：Steam250 排行榜 + 鉴赏家精选"""
@@ -1249,7 +1165,7 @@ class SteamToolbox:
 
                     if src_type == "steam250":
                         # Steam250 抓取
-                        ids, error = self.protected_fetch_steam250_ids(url_or_id)
+                        ids, error = self.core.fetch_steam250_ids(url_or_id)
                         if error:
                             update_status(f"❌ {name}: {error}")
                         else:
@@ -1417,7 +1333,7 @@ class SteamToolbox:
 
         def do_export():
             # 先选择目录，再获取数据
-            dest_dir = filedialog.askdirectory(initialdir=self.core.current_dir, title="选择保存文件夹")
+            dest_dir = filedialog.askdirectory(initialdir=os.path.expanduser('~'), title="选择保存文件夹")
             if not dest_dir:
                 return
 
@@ -1446,7 +1362,7 @@ class SteamToolbox:
                     self.core.save_json(data, backup_description="从个人推荐分类更新收藏夹")
                     rec_win.destroy()
 
-                self.protected_show_batch_update_mapping(data, all_cols, sources, on_done,
+                self.show_batch_update_mapping(data, all_cols, sources, on_done,
                                                          parent_to_close=rec_win,
                                                          saved_mappings_key="recommend_update_mappings")
 
@@ -1495,7 +1411,7 @@ class SteamToolbox:
         def do_select_files():
             nonlocal merged_ids, merge_stats
             file_paths = filedialog.askopenfilenames(
-                initialdir=self.core.current_dir, title="选择 SteamDB 源代码文件 (可多选)",
+                initialdir=os.path.expanduser('~'), title="选择 SteamDB 源代码文件 (可多选)",
                 filetypes=[("HTML files", "*.html"), ("Text files", "*.txt"), ("All files", "*.*")]
             )
             if not file_paths: return
@@ -1552,7 +1468,7 @@ class SteamToolbox:
             name = simpledialog.askstring("导出设置", "请输入生成的 TXT 文件名：",
                                           initialvalue=self.core.sanitize_filename(name_var.get()))
             if not name: return
-            save_path = filedialog.asksaveasfilename(initialdir=self.core.current_dir, title="保存 AppID 列表",
+            save_path = filedialog.asksaveasfilename(initialdir=os.path.expanduser('~'), title="保存 AppID 列表",
                                                      defaultextension=".txt",
                                                      initialfile=f"{self.core.sanitize_filename(name)}.txt",
                                                      filetypes=[("Text files", "*.txt")])
@@ -1575,7 +1491,7 @@ class SteamToolbox:
                 self.core.save_json(data, backup_description="从 SteamDB 更新收藏夹")
                 db_win.destroy()
 
-            self.protected_show_batch_update_mapping(data, all_cols, sources, on_done, parent_to_close=db_win)
+            self.show_batch_update_mapping(data, all_cols, sources, on_done, parent_to_close=db_win)
 
         btn_frame = tk.Frame(db_win)
         btn_frame.pack(pady=15)
@@ -1598,16 +1514,16 @@ class SteamToolbox:
         account_frame = tk.Frame(bk_win, bg="#f0f0f0", pady=8)
         account_frame.pack(fill="x")
         tk.Label(account_frame,
-                 text=f"📂 当前账号: {self.core.current_account['persona_name']} ({self.core.current_account['friend_code']})",
+                 text=f"📂 当前账号: {self.core.current_account.persona_name} ({self.core.current_account.steam_id3})",
                  font=("微软雅黑", 10, "bold"), bg="#f0f0f0").pack(side="left", padx=15)
 
         # 当前文件信息
         current_frame = tk.LabelFrame(bk_win, text="📄 当前使用的文件", font=("微软雅黑", 10, "bold"), padx=10, pady=10)
         current_frame.pack(fill="x", padx=15, pady=(10, 5))
 
-        if os.path.exists(self.core.json_path):
-            file_size = os.path.getsize(self.core.json_path)
-            file_mtime = datetime.fromtimestamp(os.path.getmtime(self.core.json_path))
+        if os.path.exists(self.core.current_account.storage_path):
+            file_size = os.path.getsize(self.core.current_account.storage_path)
+            file_mtime = datetime.fromtimestamp(os.path.getmtime(self.core.current_account.storage_path))
 
             # 统计收藏夹数量
             try:
@@ -1617,7 +1533,7 @@ class SteamToolbox:
             except:
                 col_count = "?"
 
-            info_text = f"路径: {self.core.json_path}\n大小: {file_size:,} 字节 | 修改时间: {file_mtime.strftime('%Y-%m-%d %H:%M:%S')} | 收藏夹数: {col_count}"
+            info_text = f"路径: {self.core.current_account.storage_path}\n大小: {file_size:,} 字节 | 修改时间: {file_mtime.strftime('%Y-%m-%d %H:%M:%S')} | 收藏夹数: {col_count}"
             tk.Label(current_frame, text=info_text, font=("微软雅黑", 9), justify="left", wraplength=650).pack(
                 anchor="w")
 
@@ -2099,101 +2015,6 @@ class SteamToolbox:
         tk.Label(igdb_win, text="⚠️ API 凭证包含敏感信息，请勿分享配置文件给他人",
                  font=("微软雅黑", 8), fg="red").pack(pady=(0, 15))
 
-    # ==================== 主界面 ====================
-    def main_ui(self):
-        """启动主界面（含账号选择）"""
-        # 扫描账号
-        self.core.accounts = SteamAccountScanner.scan_accounts()
-
-        if not self.core.accounts:
-            # 未找到账号，显示提示
-            root = tk.Tk()
-            root.title("Steam 库管理助手")
-            root.resizable(False, False)
-
-            tk.Label(root, text="❌ 未找到 Steam 账号", font=("微软雅黑", 14, "bold"), fg="red").pack(pady=20)
-            tk.Label(root,
-                     text="请确保:\n1. Steam 已安装在默认路径\n2. 至少登录过一个 Steam 账号\n3. 账号目录中存在 cloud-storage-namespace-1.json 文件",
-                     font=("微软雅黑", 10), justify="left").pack(padx=30, pady=10)
-
-            # 手动选择路径
-            def manual_select():
-                path = filedialog.askopenfilename(
-                    title="选择 cloud-storage-namespace-1.json 文件",
-                    filetypes=[("JSON files", "*.json")]
-                )
-                if path and os.path.exists(path):
-                    # 尝试从路径推断账号信息
-                    match = re.search(r'userdata[/\\](\d+)[/\\]', path)
-                    friend_code = match.group(1) if match else "unknown"
-
-                    self.core.accounts = [{
-                        'friend_code': friend_code,
-                        'userdata_path': os.path.dirname(os.path.dirname(os.path.dirname(path))),
-                        'json_path': path,
-                        'persona_name': f"手动选择 ({friend_code})",
-                        'steam_path': "",
-                    }]
-                    root.destroy()
-                    self.show_account_selector()
-
-            tk.Button(root, text="📂 手动选择文件", command=manual_select, font=("微软雅黑", 10)).pack(pady=20)
-
-            root.update_idletasks()
-            cw, ch = root.winfo_reqwidth(), root.winfo_reqheight()
-            sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-            root.geometry(f"{cw}x{ch}+{int((sw - cw) / 2)}+{int((sh - ch) / 2)}")
-            root.mainloop()
-        elif len(self.core.accounts) == 1:
-            # 只有一个账号，直接使用
-            self.core.set_current_account(self.core.accounts[0])
-            self.show_main_window()
-        else:
-            # 多个账号，显示选择界面
-            self.show_account_selector()
-
-    def show_account_selector(self):
-        """显示账号选择界面"""
-        sel_root = tk.Tk()
-        sel_root.title("选择 Steam 账号")
-        sel_root.resizable(False, False)
-
-        tk.Label(sel_root, text="🎮 检测到多个 Steam 账号", font=("微软雅黑", 12, "bold")).pack(pady=(20, 10))
-        tk.Label(sel_root, text="请选择要管理的账号：", font=("微软雅黑", 10)).pack()
-
-        list_frame = tk.Frame(sel_root)
-        list_frame.pack(fill="both", expand=True, padx=20, pady=10)
-
-        listbox = tk.Listbox(list_frame, width=60, height=10, font=("微软雅黑", 10))
-        listbox.pack(side="left", fill="both", expand=True)
-
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
-        scrollbar.pack(side="right", fill="y")
-        listbox.config(yscrollcommand=scrollbar.set)
-
-        for acc in self.core.accounts:
-            listbox.insert("end", f"{acc['persona_name']} (好友代码: {acc['friend_code']})")
-
-        if self.core.accounts:
-            listbox.selection_set(0)
-
-        def on_select():
-            selected = listbox.curselection()
-            if not selected:
-                messagebox.showwarning("提示", "请选择一个账号。")
-                return
-            self.core.set_current_account(self.core.accounts[selected[0]])
-            sel_root.destroy()
-            self.show_main_window()
-
-        tk.Button(sel_root, text="✅ 确认选择", command=on_select, font=("微软雅黑", 10), width=15).pack(pady=15)
-
-        sel_root.update_idletasks()
-        cw, ch = sel_root.winfo_reqwidth(), sel_root.winfo_reqheight()
-        sw, sh = sel_root.winfo_screenwidth(), sel_root.winfo_screenheight()
-        sel_root.geometry(f"{cw}x{ch}+{int((sw - cw) / 2)}+{int((sh - ch) / 2)}")
-        sel_root.mainloop()
-
     def show_main_window(self):
         """显示主功能窗口"""
         root = tk.Tk()
@@ -2238,27 +2059,16 @@ class SteamToolbox:
 
         root.protocol("WM_DELETE_WINDOW", on_close)
 
-        # ====== 当前账号信息（高亮显示） ======
+        # ====== 当前账号信息 ======
         account_frame = tk.Frame(root, bg="#4a90d9", pady=10)
         account_frame.pack(fill="x")
 
-        acc_info = f"👤 {self.core.current_account['persona_name']}  |  好友代码: {self.core.current_account['friend_code']}"
+        acc_info = f"👤 {self.core.current_account.persona_name}  |  <{self.core.current_account.steam_id3}>"
         tk.Label(account_frame, text=acc_info, font=("微软雅黑", 11, "bold"), bg="#4a90d9", fg="white").pack(
             side="left", padx=15)
 
-        if len(self.core.accounts) > 1:
-            def switch_account():
-                if self._has_pending_changes:
-                    ans = messagebox.askyesnocancel("未保存的更改", "您有未保存的更改。\n\n是否在切换账号前保存？")
-                    if ans is None:
-                        return
-                    if ans:
-                        commit_save()
-                root.destroy()
-                self.show_account_selector()
 
-            tk.Button(account_frame, text="🔄 切换账号", command=switch_account, font=("微软雅黑", 9)).pack(side="right",
-                                                                                                           padx=15)
+        tk.Button(account_frame, text="🔄 切换账号", command=self.back_to_select_callback, font=("微软雅黑", 9)).pack(side="right", padx=15)
 
         # ====== 主内容区（左侧收藏夹列表 + 右侧功能控制区） ======
         main_container = tk.Frame(root)
@@ -2511,8 +2321,8 @@ class SteamToolbox:
         # ====== 功能按钮 ======
         row1_frame = tk.Frame(right_panel, padx=35)
         row1_frame.pack(fill="x", pady=(5, 0))
-        ttk.Button(row1_frame, text="📁 批量导入", width=15, command=self.import_from_txt).pack(side="left",
-                                                                                               padx=(0, 10))
+        ttk.Button(row1_frame, text="📁 批量导入", width=15, command=self.import_collection).pack(side="left",
+                                                                                                 padx=(0, 10))
         ttk.Button(row1_frame, text="📤 批量导出", width=15, command=self.export_static_collection).pack(side="left",
                                                                                                         padx=10)
         ttk.Button(row1_frame, text="🔄 批量更新", width=15, command=self.update_static_collection).pack(side="left",
@@ -2608,3 +2418,95 @@ class SteamToolbox:
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         root.geometry(f"{cw}x{ch}+{int((sw - cw) / 2)}+{int((sh - ch) / 2)}")
         root.mainloop()
+
+
+class SteamToolboxIntro:
+    """
+    Steam 库管理助手 账号选择界面
+    负责选中单个 Steam 账号并启动主界面
+    """
+
+    # ==================== 主界面 ====================
+    def intro_ui(self):
+        """启动账号选择界面并将选中的账号交由 Main UI 处理"""
+        # 扫描账号
+        accounts = SteamDiscovery.scan_accounts()
+
+        if not accounts:
+            # 未找到账号，显示提示并允许手动选择 cloud-storage-namespace-1.json
+            root = tk.Tk()
+            root.title("Steam 库管理助手")
+            root.resizable(False, False)
+
+            tk.Label(root, text="❌ 自动发现 Steam 账号失败", font=("微软雅黑", 14, "bold"), fg="red").pack(pady=20)
+            tk.Label(root,
+                     text="请确保:\n1. Steam 已安装并登录\n2. 账号目录中存在 cloud-storage-namespace-1.json 文件",
+                     font=("微软雅黑", 10), justify="left").pack(padx=30, pady=10)
+
+            # 手动选择路径
+            def manual_select():
+                path = filedialog.askopenfilename(
+                    title="选择 cloud-storage-namespace-1.json 文件",
+                    filetypes=[("JSON files", "*.json")]
+                )
+                if path and os.path.exists(path):
+                    account = SteamAccount.from_storage_json(path)
+                    if account:
+                        root.destroy()
+                        main_ui = SteamToolbox(account, self.intro_ui)
+                        main_ui.show_main_window()
+
+            tk.Button(root, text="📂 手动选择 cloud storage 文件", command=manual_select, font=("微软雅黑", 10)).pack(pady=20)
+
+            root.update_idletasks()
+            cw, ch = root.winfo_reqwidth(), root.winfo_reqheight()
+            sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+            root.geometry(f"{cw}x{ch}+{int((sw - cw) / 2)}+{int((sh - ch) / 2)}")
+            root.mainloop()
+        elif len(accounts) == 1:
+            # 只有一个账号，直接使用
+            app = SteamToolbox(accounts[0], self.intro_ui)
+            app.show_main_window()
+        else:
+            # 多个账号，显示选择界面
+            select_root = tk.Tk()
+            select_root.title("选择 Steam 账号")
+            select_root.resizable(False, False)
+
+            tk.Label(select_root, text="🎮 检测到多个 Steam 账号", font=("微软雅黑", 12, "bold")).pack(pady=(20, 10))
+            tk.Label(select_root, text="请选择要管理的账号：", font=("微软雅黑", 10)).pack()
+
+            list_frame = tk.Frame(select_root)
+            list_frame.pack(fill="both", expand=True, padx=20, pady=10)
+
+            listbox = tk.Listbox(list_frame, width=60, height=10, font=("微软雅黑", 10))
+            listbox.pack(side="left", fill="both", expand=True)
+
+            scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+            scrollbar.pack(side="right", fill="y")
+            listbox.config(yscrollcommand=scrollbar.set)
+
+            for acc in accounts:
+                display = f"{acc.persona_name} (好友代码: {getattr(acc, 'steam_id3', getattr(acc, 'friend_code', ''))})"
+                listbox.insert("end", display)
+
+            if accounts:
+                listbox.selection_set(0)
+
+            def on_select():
+                selected = listbox.curselection()
+                if not selected:
+                    messagebox.showwarning("提示", "请选择一个账号。")
+                    return
+                chosen = accounts[selected[0]]
+                select_root.destroy()
+                main_ui = SteamToolbox(chosen, self.intro_ui)
+                main_ui.show_main_window()
+
+            tk.Button(select_root, text="✅ 确认选择", command=on_select, font=("微软雅黑", 10), width=15).pack(pady=15)
+
+            select_root.update_idletasks()
+            cw, ch = select_root.winfo_reqwidth(), select_root.winfo_reqheight()
+            sw, sh = select_root.winfo_screenwidth(), select_root.winfo_screenheight()
+            select_root.geometry(f"{cw}x{ch}+{int((sw - cw) / 2)}+{int((sh - ch) / 2)}")
+            select_root.mainloop()

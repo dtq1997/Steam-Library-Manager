@@ -1,5 +1,5 @@
-from ui import SteamToolbox
+from ui import SteamToolboxIntro
 
 if __name__ == "__main__":
-    app = SteamToolbox()
-    app.main_ui()
+    app = SteamToolboxIntro()
+    app.intro_ui()

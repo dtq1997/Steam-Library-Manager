@@ -14,10 +14,6 @@ class BackupManager:
         self.backup_dir = os.path.join(self.json_dir, "backups")
         self.json_name = os.path.basename(json_path)
 
-    def ensure_backup_dir(self):
-        """确保备份目录存在"""
-        if not os.path.exists(self.backup_dir):
-            os.makedirs(self.backup_dir)
 
     def create_backup(self, description=""):
         """创建备份
@@ -31,7 +27,7 @@ class BackupManager:
         if not os.path.exists(self.json_path):
             return None
 
-        self.ensure_backup_dir()
+        os.makedirs(self.backup_dir, exist_ok=True)
 
         # 生成备份文件名：原文件名_时间戳.json
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
