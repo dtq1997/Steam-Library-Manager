@@ -26,27 +26,41 @@ _OriginalToplevel = tk.Toplevel  # 保存原始 Toplevel，供内部使用
 def _patch_dialogs_topmost():
     """启动时调用一次，猴子补丁三类弹窗，使其始终显示在最前面。"""
 
-    # --- 1. Toplevel 子窗口：自动置顶 ---
+    # --- 1. Toplevel 子窗口：自动置顶并抢焦点 ---
     class _TopmostToplevel(_OriginalToplevel):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.attributes('-topmost', True)
+            self.lift()
+            self.focus_force()
 
     tk.Toplevel = _TopmostToplevel
 
-    # --- 2. messagebox：用隐藏的置顶窗口做 parent ---
+    # --- 2. messagebox：用不可见的置顶锚点窗口做 parent ---
+    #     ⚠️ 不能用 withdraw()，Windows 上隐藏的窗口无法让子对话框置顶
+    def _make_topmost_anchor():
+        """创建一个 1x1 像素、无边框、置顶的锚点窗口"""
+        anchor = _OriginalToplevel()
+        anchor.overrideredirect(True)          # 去掉标题栏和边框
+        anchor.attributes('-topmost', True)
+        anchor.attributes('-alpha', 0)         # 完全透明（支持的平台上）
+        anchor.geometry('1x1+{0}+{1}'.format(  # 1像素，屏幕中央
+            anchor.winfo_screenwidth() // 2,
+            anchor.winfo_screenheight() // 2
+        ))
+        anchor.update()
+        anchor.focus_force()
+        return anchor
+
     def _wrap_messagebox(func):
         def wrapper(*args, **kwargs):
             if 'parent' not in kwargs:
-                tmp = _OriginalToplevel()
-                tmp.withdraw()
-                tmp.attributes('-topmost', True)
-                tmp.update_idletasks()
-                kwargs['parent'] = tmp
+                anchor = _make_topmost_anchor()
+                kwargs['parent'] = anchor
                 try:
                     return func(*args, **kwargs)
                 finally:
-                    tmp.destroy()
+                    anchor.destroy()
             return func(*args, **kwargs)
         return wrapper
 
@@ -61,15 +75,12 @@ def _patch_dialogs_topmost():
     def _wrap_simpledialog(func):
         def wrapper(*args, **kwargs):
             if 'parent' not in kwargs:
-                tmp = _OriginalToplevel()
-                tmp.withdraw()
-                tmp.attributes('-topmost', True)
-                tmp.update_idletasks()
-                kwargs['parent'] = tmp
+                anchor = _make_topmost_anchor()
+                kwargs['parent'] = anchor
                 try:
                     return func(*args, **kwargs)
                 finally:
-                    tmp.destroy()
+                    anchor.destroy()
             return func(*args, **kwargs)
         return wrapper
 
