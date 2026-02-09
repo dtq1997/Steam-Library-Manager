@@ -16,6 +16,72 @@ from account_manager import SteamDiscovery, SteamAccount
 from core import SteamToolboxCore
 
 
+# ═══════════════════════════════════════════════════════════════
+# 全局补丁：让所有弹窗（messagebox / simpledialog / Toplevel）始终置顶
+# ═══════════════════════════════════════════════════════════════
+
+_OriginalToplevel = tk.Toplevel  # 保存原始 Toplevel，供内部使用
+
+
+def _patch_dialogs_topmost():
+    """启动时调用一次，猴子补丁三类弹窗，使其始终显示在最前面。"""
+
+    # --- 1. Toplevel 子窗口：自动置顶 ---
+    class _TopmostToplevel(_OriginalToplevel):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.attributes('-topmost', True)
+
+    tk.Toplevel = _TopmostToplevel
+
+    # --- 2. messagebox：用隐藏的置顶窗口做 parent ---
+    def _wrap_messagebox(func):
+        def wrapper(*args, **kwargs):
+            if 'parent' not in kwargs:
+                tmp = _OriginalToplevel()
+                tmp.withdraw()
+                tmp.attributes('-topmost', True)
+                tmp.update_idletasks()
+                kwargs['parent'] = tmp
+                try:
+                    return func(*args, **kwargs)
+                finally:
+                    tmp.destroy()
+            return func(*args, **kwargs)
+        return wrapper
+
+    for name in ('showinfo', 'showwarning', 'showerror',
+                 'askyesno', 'askyesnocancel', 'askquestion',
+                 'askretrycancel', 'askokcancel'):
+        original = getattr(messagebox, name, None)
+        if original:
+            setattr(messagebox, name, _wrap_messagebox(original))
+
+    # --- 3. simpledialog：同理 ---
+    def _wrap_simpledialog(func):
+        def wrapper(*args, **kwargs):
+            if 'parent' not in kwargs:
+                tmp = _OriginalToplevel()
+                tmp.withdraw()
+                tmp.attributes('-topmost', True)
+                tmp.update_idletasks()
+                kwargs['parent'] = tmp
+                try:
+                    return func(*args, **kwargs)
+                finally:
+                    tmp.destroy()
+            return func(*args, **kwargs)
+        return wrapper
+
+    for name in ('askstring', 'askinteger', 'askfloat'):
+        original = getattr(simpledialog, name, None)
+        if original:
+            setattr(simpledialog, name, _wrap_simpledialog(original))
+
+
+_patch_dialogs_topmost()
+
+
 class SteamToolbox:
     def __init__(self, account: SteamAccount, back_to_select_callback: Callable):
         self.core = SteamToolboxCore(account)
