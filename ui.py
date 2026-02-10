@@ -24,43 +24,64 @@ _OriginalToplevel = tk.Toplevel  # 保存原始 Toplevel，供内部使用
 
 
 def _patch_dialogs_topmost():
-    """启动时调用一次，猴子补丁三类弹窗，使其始终显示在最前面。"""
+    """启动时调用一次，猴子补丁弹窗类，确保对话框以正确的 parent 弹出。
 
-    # --- 1. Toplevel 子窗口：自动置顶并抢焦点 ---
+    v2.2 改进：不再强制所有窗口 -topmost，仅保留 parent 查找逻辑，
+    避免功能窗口遮挡用户的其他工作。
+    """
+
+    # --- 1. Toplevel 子窗口：不再强制置顶，仅 lift + 抢焦点 ---
     class _TopmostToplevel(_OriginalToplevel):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            self.attributes('-topmost', True)
             self.lift()
             self.focus_force()
 
     tk.Toplevel = _TopmostToplevel
 
-    # --- 2. messagebox：用不可见的置顶锚点窗口做 parent ---
-    #     ⚠️ 不能用 withdraw()，Windows 上隐藏的窗口无法让子对话框置顶
-    def _make_topmost_anchor():
-        """创建一个 1x1 像素、无边框、置顶的锚点窗口"""
-        anchor = _OriginalToplevel()
-        anchor.overrideredirect(True)          # 去掉标题栏和边框
-        anchor.attributes('-topmost', True)
-        anchor.attributes('-alpha', 0)         # 完全透明（支持的平台上）
-        anchor.geometry('1x1+{0}+{1}'.format(  # 1像素，屏幕中央
-            anchor.winfo_screenwidth() // 2,
-            anchor.winfo_screenheight() // 2
-        ))
-        anchor.update()
-        anchor.focus_force()
-        return anchor
+    # --- 辅助：找到当前焦点所在的最上层窗口 ---
+    def _find_active_toplevel():
+        """查找当前焦点所在的 Toplevel，找不到则回退到 Tk 根窗口。"""
+        try:
+            focus_w = None
+            root = tk._default_root
+            if root:
+                try:
+                    focus_w = root.focus_get()
+                except KeyError:
+                    pass
+            if focus_w is not None:
+                w = focus_w
+                while w is not None:
+                    if isinstance(w, (_OriginalToplevel, tk.Tk)):
+                        w.lift()
+                        return w
+                    w = getattr(w, 'master', None)
+            if root:
+                toplevels = [w for w in root.winfo_children()
+                             if isinstance(w, _OriginalToplevel) and w.winfo_viewable()]
+                if toplevels:
+                    top = toplevels[-1]
+                    top.lift()
+                    return top
+                return root
+        except Exception:
+            pass
+        return None
 
+    # --- 2. messagebox ---
     def _wrap_messagebox(func):
         def wrapper(*args, **kwargs):
             if 'parent' not in kwargs:
-                anchor = _make_topmost_anchor()
-                kwargs['parent'] = anchor
+                parent = _find_active_toplevel()
+                if parent:
+                    kwargs['parent'] = parent
+            p = kwargs.get('parent')
+            if p and hasattr(p, 'lift'):
                 try:
-                    return func(*args, **kwargs)
-                finally:
-                    anchor.destroy()
+                    p.lift()
+                except Exception:
+                    pass
             return func(*args, **kwargs)
         return wrapper
 
@@ -71,16 +92,19 @@ def _patch_dialogs_topmost():
         if original:
             setattr(messagebox, name, _wrap_messagebox(original))
 
-    # --- 3. simpledialog：同理 ---
+    # --- 3. simpledialog ---
     def _wrap_simpledialog(func):
         def wrapper(*args, **kwargs):
             if 'parent' not in kwargs:
-                anchor = _make_topmost_anchor()
-                kwargs['parent'] = anchor
+                parent = _find_active_toplevel()
+                if parent:
+                    kwargs['parent'] = parent
+            p = kwargs.get('parent')
+            if p and hasattr(p, 'lift'):
                 try:
-                    return func(*args, **kwargs)
-                finally:
-                    anchor.destroy()
+                    p.lift()
+                except Exception:
+                    pass
             return func(*args, **kwargs)
         return wrapper
 
@@ -88,6 +112,28 @@ def _patch_dialogs_topmost():
         original = getattr(simpledialog, name, None)
         if original:
             setattr(simpledialog, name, _wrap_simpledialog(original))
+
+    # --- 4. filedialog ---
+    def _wrap_filedialog(func):
+        def wrapper(*args, **kwargs):
+            if 'parent' not in kwargs:
+                parent = _find_active_toplevel()
+                if parent:
+                    kwargs['parent'] = parent
+            p = kwargs.get('parent')
+            if p and hasattr(p, 'lift'):
+                try:
+                    p.lift()
+                except Exception:
+                    pass
+            return func(*args, **kwargs)
+        return wrapper
+
+    for name in ('askopenfilename', 'asksaveasfilename', 'askopenfilenames',
+                 'askdirectory', 'askopenfile', 'asksaveasfile'):
+        original = getattr(filedialog, name, None)
+        if original:
+            setattr(filedialog, name, _wrap_filedialog(original))
 
 
 _patch_dialogs_topmost()
@@ -157,7 +203,7 @@ class SteamToolbox:
 
         fmt_win = tk.Toplevel()
         fmt_win.title("批量导出收藏夹")
-        fmt_win.attributes("-topmost", True)
+        # （不再强制置顶）
         fmt_win.resizable(False, False)
 
         tk.Label(fmt_win, text=f"已选中 {len(selected)} 个收藏夹，请选择导出格式：",
@@ -227,7 +273,7 @@ class SteamToolbox:
         """批量更新：选择来源格式（TXT 或 JSON），然后一屏映射所有来源到目标收藏夹"""
         fmt_win = tk.Toplevel()
         fmt_win.title("批量更新收藏夹")
-        fmt_win.attributes("-topmost", True)
+        # （不再强制置顶）
         fmt_win.resizable(False, False)
 
         tk.Label(fmt_win, text="请选择用于更新的来源文件格式：",
@@ -322,7 +368,7 @@ class SteamToolbox:
         """通用的批量更新映射界面：一屏选择所有来源到目标收藏夹+更新模式"""
         up_win = tk.Toplevel()
         up_win.title("批量更新收藏夹")
-        up_win.attributes("-topmost", True)
+        # （不再强制置顶）
 
         tk.Label(up_win, text="请为每个来源选择目标收藏夹和更新模式：",
                  font=("微软雅黑", 10, "bold")).pack(pady=(15, 10))
@@ -345,7 +391,10 @@ class SteamToolbox:
         def _create_row(parent, key, d):
             row_frame = tk.Frame(parent)
             row_frame.pack(fill="x", pady=5)
-            tk.Label(row_frame, text=f"📦 {d['name']} ({len(d['ids'])} 个)",
+            display_name = d['name']
+            if len(display_name) > 50:
+                display_name = display_name[:47] + "…"
+            tk.Label(row_frame, text=f"📦 {display_name} ({len(d['ids'])} 个)",
                      font=("微软雅黑", 9), anchor="w").pack(side="left")
             tk.Label(row_frame, text="→", font=("微软雅黑", 9)).pack(side="left", padx=10)
             combo = ttk.Combobox(row_frame, values=target_names,
@@ -473,7 +522,7 @@ class SteamToolbox:
         if data is None: return
         sync_win = tk.Toplevel()
         sync_win.title("批量同步 Steam 用户游戏库")
-        sync_win.attributes("-topmost", True)
+        # （不再强制置顶）
         tk.Label(sync_win, text="1. 请输入对方的 Steam 好友代码（每行一个）", font=("微软雅黑", 10, "bold")).pack(
             pady=(15, 0))
         codes_text = tk.Text(sync_win, height=8, width=60)
@@ -506,7 +555,7 @@ class SteamToolbox:
         sel_win = tk.Toplevel()
         sel_win.title("从其他来源获取 Steam 游戏列表")
         sel_win.resizable(False, False)
-        sel_win.attributes("-topmost", True)
+        # （不再强制置顶）
         tk.Label(sel_win, text="请选择获取 AppID 的来源渠道：", font=("微软雅黑", 10), pady=15).pack(padx=30)
 
         def _make_color_btn(parent, text, bg, command):
@@ -530,7 +579,7 @@ class SteamToolbox:
         if data is None: return
         cur_win = tk.Toplevel()
         cur_win.title("同步 Steam 列表页面")
-        cur_win.attributes("-topmost", True)
+        # （不再强制置顶）
 
         fetched_ids = []
         fetched_name = tk.StringVar(value="")
@@ -793,7 +842,7 @@ class SteamToolbox:
 
         rec_win = tk.Toplevel()
         rec_win.title("从推荐来源获取")
-        rec_win.attributes("-topmost", True)
+        # （不再强制置顶）
 
         # 使用指南（明确说明勾选后的文字会成为收藏夹名称）
         guide_frame = tk.Frame(rec_win)
@@ -828,9 +877,19 @@ class SteamToolbox:
         check_vars = {}
         year_check_vars = {}  # 专门存储年份选项
 
-        # ===== Steam250 区域 =====
-        s250_frame = tk.LabelFrame(rec_win, text="📊 Steam250 排行榜", font=("微软雅黑", 10, "bold"), padx=10, pady=5)
-        s250_frame.pack(fill="x", padx=20, pady=(10, 5))
+        # ===== 主内容区：左右两栏布局 =====
+        main_content = tk.Frame(rec_win)
+        main_content.pack(fill="both", expand=True, padx=10, pady=(5, 0))
+
+        left_col = tk.Frame(main_content)
+        left_col.pack(side="left", fill="y", padx=(10, 5), anchor="n")
+
+        right_col = tk.Frame(main_content)
+        right_col.pack(side="left", fill="both", expand=True, padx=(5, 10))
+
+        # ===== 左栏：Steam250 区域 =====
+        s250_frame = tk.LabelFrame(left_col, text="📊 Steam250 排行榜", font=("微软雅黑", 10, "bold"), padx=10, pady=5)
+        s250_frame.pack(fill="x", pady=(0, 5))
 
         # 固定的三个排行榜
         for key, src_type, url, name in steam250_fixed_sources:
@@ -860,9 +919,9 @@ class SteamToolbox:
             year_check_vars[key] = (var, "steam250", url, name, year)
             tk.Checkbutton(year_inner_frame, text=str(year), variable=var, font=("微软雅黑", 9)).pack(side="left")
 
-        # ===== 全选按钮区域 =====
-        select_all_frame = tk.Frame(rec_win)
-        select_all_frame.pack(fill="x", padx=20, pady=(5, 0))
+        # Steam250 全选按钮（放在 s250_frame 内部）
+        select_all_frame = tk.Frame(s250_frame)
+        select_all_frame.pack(fill="x", pady=(5, 0))
 
         def select_all_s250():
             for k, v in check_vars.items():
@@ -883,9 +942,9 @@ class SteamToolbox:
         tk.Button(select_all_frame, text="☐ 取消全选 Steam250", command=deselect_all_s250, font=("微软雅黑", 8)).pack(
             side="left")
 
-        # ===== 鉴赏家精选区域 =====
-        curator_frame = tk.LabelFrame(rec_win, text="🎮 鉴赏家精选", font=("微软雅黑", 10, "bold"), padx=10, pady=5)
-        curator_frame.pack(fill="x", padx=20, pady=5)
+        # ===== 左栏：鉴赏家精选区域 =====
+        curator_frame = tk.LabelFrame(left_col, text="🎮 鉴赏家精选", font=("微软雅黑", 10, "bold"), padx=10, pady=5)
+        curator_frame.pack(fill="x", pady=5)
 
         for key, src_type, url, name in curator_sources:
             var = tk.BooleanVar(value=False)
@@ -930,13 +989,14 @@ class SteamToolbox:
             tk.Label(cookie_status_frame, text="     → 可在主界面「🔑 管理登录态 Cookie」中配置",
                      font=("微软雅黑", 8), fg="#888").pack(anchor="w")
 
-        # ===== IGDB 游戏类型分类区域 =====
-        igdb_check_vars = {}  # 存储 IGDB 类型的勾选状态
-        igdb_genres_cache = []  # 缓存已加载的类型列表
+        # ===== 右栏：IGDB 多维度分类区域 =====
+        igdb_check_vars = {}  # 存储所有 IGDB 分类项的勾选状态
+        igdb_loaded_dims = {}  # 记录各维度是否已加载 {dim_key: bool}
+        igdb_tab_widgets = {}  # 各标签页的控件引用
 
-        igdb_frame = tk.LabelFrame(rec_win, text="🏷️ 游戏类型分类（IGDB）", font=("微软雅黑", 10, "bold"), padx=10,
+        igdb_frame = tk.LabelFrame(right_col, text="🗂️ IGDB 游戏数据库分类", font=("微软雅黑", 10, "bold"), padx=10,
                                    pady=5)
-        igdb_frame.pack(fill="x", padx=20, pady=5)
+        igdb_frame.pack(fill="both", expand=True)
 
         # IGDB 凭证状态
         igdb_status_frame = tk.Frame(igdb_frame)
@@ -957,117 +1017,509 @@ class SteamToolbox:
             tk.Label(igdb_status_frame, text=" → 可在主界面「🎮 管理 IGDB API 凭证」中配置",
                      font=("微软雅黑", 8), fg="#888").pack(side="left")
 
-        # 类型列表容器（使用 Canvas 支持滚动）
-        igdb_list_container = tk.Frame(igdb_frame)
-        igdb_list_container.pack(fill="x", pady=(5, 0))
+        # ---- 标签页容器 ----
+        igdb_notebook = ttk.Notebook(igdb_frame)
+        igdb_notebook.pack(fill="both", expand=True, pady=(0, 5))
 
-        igdb_canvas = tk.Canvas(igdb_list_container, height=120, highlightthickness=1, highlightbackground="#ccc")
-        igdb_scrollbar = ttk.Scrollbar(igdb_list_container, orient="vertical", command=igdb_canvas.yview)
-        igdb_scrollable_frame = tk.Frame(igdb_canvas)
+        def _create_igdb_tab(dim_key, dim_info):
+            """创建单个维度的标签页（使用 Treeview 实现，性能优异且支持触控板原生滚动）"""
+            tab_frame = tk.Frame(igdb_notebook)
+            igdb_notebook.add(tab_frame, text=dim_info["label"])
 
-        igdb_scrollable_frame.bind(
-            "<Configure>",
-            lambda e: igdb_canvas.configure(scrollregion=igdb_canvas.bbox("all"))
-        )
+            # 搜索框
+            search_frame = tk.Frame(tab_frame)
+            search_frame.pack(fill="x", padx=5, pady=(5, 3))
+            tk.Label(search_frame, text="🔍", font=("微软雅黑", 9)).pack(side="left")
+            search_var = tk.StringVar()
+            search_entry = tk.Entry(search_frame, textvariable=search_var, font=("微软雅黑", 9))
+            search_entry.pack(side="left", fill="x", expand=True, padx=(3, 0))
 
-        igdb_canvas.create_window((0, 0), window=igdb_scrollable_frame, anchor="nw")
-        igdb_canvas.configure(yscrollcommand=igdb_scrollbar.set)
+            # Treeview 列表区域
+            tree_frame = tk.Frame(tab_frame)
+            tree_frame.pack(fill="both", expand=True, padx=5, pady=(0, 5))
 
-        igdb_canvas.pack(side="left", fill="both", expand=True)
-        igdb_scrollbar.pack(side="right", fill="y")
+            # 配置 Treeview 样式
+            style = ttk.Style()
+            style_name = f"IGDB_{dim_key}.Treeview"
+            style.configure(style_name, rowheight=24, font=("微软雅黑", 9))
 
-        # 鼠标滚轮绑定
-        def _igdb_mousewheel(event):
-            igdb_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            tree = ttk.Treeview(tree_frame, columns=("name", "link"), show="headings",
+                                selectmode="none", style=style_name)
+            tree.heading("name", text="分类名称", anchor="w")
+            tree.column("name", stretch=True, anchor="w")
+            tree.heading("link", text="", anchor="center")
+            tree.column("link", width=36, stretch=False, anchor="center")
 
-        igdb_canvas.bind("<MouseWheel>", _igdb_mousewheel)
-        igdb_scrollable_frame.bind("<MouseWheel>", _igdb_mousewheel)
+            scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+            tree.configure(yscrollcommand=scrollbar.set)
 
-        # 初始提示
-        igdb_placeholder = tk.Label(igdb_scrollable_frame, text="点击「加载类型列表」获取可用的游戏类型",
-                                    font=("微软雅黑", 9), fg="#888")
-        igdb_placeholder.pack(pady=20)
+            tree.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
 
-        # 加载类型列表函数
-        def load_igdb_genres():
+            # 数据存储
+            item_slugs = {}       # iid -> slug（用于 IGDB 链接）
+            all_iids = []         # 所有 item id（用于搜索过滤）
+            iid_name_map = {}     # iid -> item_name_lower（用于搜索）
+            detached_iids = set()  # 当前被搜索过滤隐藏的 iid
+
+            # 点击切换选中状态 / 点击链接列打开 IGDB 页面
+            def on_tree_click(event):
+                region = tree.identify_region(event.x, event.y)
+                if region not in ("cell", "tree"):
+                    return
+                iid = tree.identify_row(event.y)
+                if not iid or iid.startswith("_"):
+                    return
+                col = tree.identify_column(event.x)
+
+                # 点击链接列 → 打开 IGDB 页面
+                if col == "#2":
+                    slug = item_slugs.get(iid, "")
+                    url_path = self.core.IGDB_URL_PATHS.get(dim_key, dim_key)
+                    if slug:
+                        webbrowser.open(f"https://www.igdb.com/{url_path}/{slug}")
+                    return
+
+                # 点击名称列 → 切换选中状态
+                key = iid
+                if key in igdb_check_vars:
+                    var = igdb_check_vars[key][0]
+                    new_val = not var.get()
+                    var.set(new_val)
+                    # 更新显示文字中的 ☐/☑
+                    current_text = tree.item(iid, "values")[0]
+                    idx = 0
+                    try:
+                        idx = tree.index(iid)
+                    except Exception:
+                        pass
+                    if new_val:
+                        new_text = current_text.replace("☐", "☑", 1)
+                        tag = "even_checked" if idx % 2 == 0 else "checked"
+                    else:
+                        new_text = current_text.replace("☑", "☐", 1)
+                        tag = "even" if idx % 2 == 0 else "unchecked"
+                    tree.item(iid, values=(new_text, tree.item(iid, "values")[1]), tags=(tag,))
+
+            tree.bind("<ButtonRelease-1>", on_tree_click)
+
+            # 禁止拖拽列分隔线
+            def block_separator(event, _tree=tree):
+                if _tree.identify_region(event.x, event.y) == "separator":
+                    return "break"
+            tree.bind("<Button-1>", block_separator)
+
+            # 样式：选中行底色
+            tree.tag_configure("checked", background="#d4edda")
+            tree.tag_configure("unchecked", background="")
+            tree.tag_configure("even", background="#f8f8f8")
+            tree.tag_configure("even_checked", background="#c3e6cb")
+
+            # 占位文字（加载前）
+            placeholder_iid = tree.insert("", "end", iid="_placeholder",
+                                           values=("正在加载分类列表...", ""), tags=("unchecked",))
+
+            # 保存引用
+            igdb_tab_widgets[dim_key] = {
+                "tree": tree,
+                "search_var": search_var,
+                "search_entry": search_entry,
+                "tab_frame": tab_frame,
+                "item_slugs": item_slugs,
+                "all_iids": all_iids,
+                "iid_name_map": iid_name_map,
+                "detached_iids": detached_iids,
+            }
+
+            # 搜索过滤逻辑（使用 Treeview detach/reattach，性能极好）
+            def on_search_changed(*args, _dim_key=dim_key):
+                tw = igdb_tab_widgets[_dim_key]
+                query = tw["search_var"].get().strip().lower()
+                _tree = tw["tree"]
+                _all_iids = tw["all_iids"]
+                _iid_name_map = tw["iid_name_map"]
+                _detached = tw["detached_iids"]
+
+                if query == "":
+                    # 恢复所有隐藏的项
+                    for iid in list(_detached):
+                        _tree.reattach(iid, "", "end")
+                    _detached.clear()
+                    # 重新排序（恢复原始顺序）
+                    for idx, iid in enumerate(_all_iids):
+                        _tree.move(iid, "", idx)
+                else:
+                    for iid in _all_iids:
+                        name_lower = _iid_name_map.get(iid, "")
+                        if query in name_lower:
+                            if iid in _detached:
+                                _tree.reattach(iid, "", "end")
+                                _detached.discard(iid)
+                        else:
+                            if iid not in _detached:
+                                _tree.detach(iid)
+                                _detached.add(iid)
+
+            search_var.trace_add("write", on_search_changed)
+
+        # 创建所有标签页
+        for dim_key, dim_info in self.core.IGDB_DIMENSIONS.items():
+            _create_igdb_tab(dim_key, dim_info)
+
+        # ---- 🏢 开发商/发行商搜索标签页 ----
+        company_tab_frame = tk.Frame(igdb_notebook)
+        igdb_notebook.add(company_tab_frame, text="🏢 开发商/发行商")
+
+        company_search_frame = tk.Frame(company_tab_frame)
+        company_search_frame.pack(fill="x", padx=5, pady=(5, 3))
+        tk.Label(company_search_frame, text="🔍", font=("微软雅黑", 9)).pack(side="left")
+        company_search_var = tk.StringVar()
+        company_search_entry = tk.Entry(company_search_frame, textvariable=company_search_var, font=("微软雅黑", 9))
+        company_search_entry.pack(side="left", fill="x", expand=True, padx=(3, 5))
+
+        def do_search_company():
+            query = company_search_var.get().strip()
+            if not query or len(query) < 2:
+                messagebox.showwarning("提示", "请输入至少 2 个字符进行搜索。")
+                return
             if not igdb_configured:
                 messagebox.showwarning("提示", "请先在主界面配置 IGDB API 凭证。")
                 return
 
-            # 清空现有内容
-            for widget in igdb_scrollable_frame.winfo_children():
-                widget.destroy()
+            # 清空旧结果
+            for iid in company_tree.get_children():
+                company_tree.delete(iid)
+            company_tree_iids.clear()
+            # 清除旧的公司选项变量
+            for k in list(igdb_check_vars.keys()):
+                if k.startswith("igdb_company_"):
+                    del igdb_check_vars[k]
 
-            tk.Label(igdb_scrollable_frame, text="正在加载游戏类型列表...",
-                     font=("微软雅黑", 9), fg="#888").pack(pady=20)
-            rec_win.update()
+            company_tree.insert("", "end", iid="_loading",
+                                values=(f"正在搜索 \"{query}\"...", ""), tags=("unchecked",))
 
-            def fetch_genres_thread():
-                genres, error = self.core.fetch_igdb_genres()
+            def search_thread():
+                try:
+                    companies, error = self.core.search_igdb_companies(query)
+                    # 批量获取每个公司的 Steam 游戏数
+                    company_counts = {}
+                    if companies and not error:
+                        try:
+                            cids = [c.get('id') for c in companies if c.get('id')]
+                            company_counts = self.core.count_igdb_company_steam_games(cids)
+                        except Exception:
+                            pass  # 计数失败不影响搜索结果显示
+                except Exception as ex:
+                    companies, error = [], f"线程异常：{type(ex).__name__}: {ex}"
+                    company_counts = {}
 
                 def update_ui():
-                    for widget in igdb_scrollable_frame.winfo_children():
-                        widget.destroy()
+                    for iid in company_tree.get_children():
+                        company_tree.delete(iid)
+                    company_tree_iids.clear()
+                    company_slugs.clear()
 
                     if error:
-                        tk.Label(igdb_scrollable_frame, text=f"❌ 加载失败：{error}",
-                                 font=("微软雅黑", 9), fg="red").pack(pady=20)
+                        company_tree.insert("", "end", iid="_error",
+                                            values=(f"❌ 搜索失败：{error}", ""), tags=("unchecked",))
+                        return
+                    if not companies:
+                        company_tree.insert("", "end", iid="_empty",
+                                            values=(f"未找到匹配 \"{query}\" 的公司", ""), tags=("unchecked",))
                         return
 
-                    if not genres:
-                        tk.Label(igdb_scrollable_frame, text="未找到游戏类型",
-                                 font=("微软雅黑", 9), fg="#888").pack(pady=20)
-                        return
+                    # 按 Steam 游戏数降序排列
+                    sorted_companies = sorted(companies,
+                        key=lambda c: (-company_counts.get(c.get('id', 0), 0), c.get('name', '')))
 
-                    igdb_genres_cache.clear()
-                    igdb_genres_cache.extend(genres)
-                    igdb_check_vars.clear()
-
-                    # 创建多列布局（每行 3 个）
-                    row_frame = None
-                    for i, genre in enumerate(genres):
-                        if i % 3 == 0:
-                            row_frame = tk.Frame(igdb_scrollable_frame)
-                            row_frame.pack(fill="x", pady=1)
-
-                        genre_id = genre.get('id')
-                        genre_name = genre.get('name', '未知')
-                        key = f"igdb_genre_{genre_id}"
-
+                    for i, company in enumerate(sorted_companies):
+                        cid = company.get('id')
+                        cname = company.get('name', '未知')
+                        cslug = company.get('slug', '')
+                        key = f"igdb_company_{cid}"
                         var = tk.BooleanVar(value=False)
-                        igdb_check_vars[key] = (var, "igdb_genre", genre_id, f"🏷️ {genre_name}")
+                        igdb_check_vars[key] = (var, "igdb_company", cid, f"🏢 {cname}")
 
-                        cb = tk.Checkbutton(row_frame, text=genre_name, variable=var,
-                                            font=("微软雅黑", 9), width=18, anchor="w")
-                        cb.pack(side="left", padx=2)
-
-                    # 更新滚动区域
-                    igdb_scrollable_frame.update_idletasks()
-                    igdb_canvas.configure(scrollregion=igdb_canvas.bbox("all"))
+                        count = company_counts.get(cid, 0)
+                        display_text = f"☐  {cname}  ({count} 个游戏)" if count > 0 else f"☐  {cname}"
+                        link_text = "🔗" if cslug else ""
+                        tags = ("even",) if i % 2 == 0 else ("unchecked",)
+                        company_tree.insert("", "end", iid=key, values=(display_text, link_text), tags=tags)
+                        company_tree_iids.append(key)
+                        if cslug:
+                            company_slugs[key] = cslug
 
                 rec_win.after(0, update_ui)
 
-            threading.Thread(target=fetch_genres_thread, daemon=True).start()
+            threading.Thread(target=search_thread, daemon=True).start()
 
-        # IGDB 按钮区域
+        company_search_btn = tk.Button(company_search_frame, text="搜索", command=do_search_company,
+                                        font=("微软雅黑", 8),
+                                        state="normal" if igdb_configured else "disabled")
+        company_search_btn.pack(side="left")
+
+        # 回车触发搜索
+        company_search_entry.bind("<Return>", lambda e: do_search_company())
+
+        # 公司结果列表（Treeview 实现，与其他标签页一致）
+        company_tree_frame = tk.Frame(company_tab_frame)
+        company_tree_frame.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+
+        style = ttk.Style()
+        style.configure("IGDB_company.Treeview", rowheight=24, font=("微软雅黑", 9))
+
+        company_tree = ttk.Treeview(company_tree_frame, columns=("name", "link"), show="headings",
+                                     selectmode="none", style="IGDB_company.Treeview")
+        company_tree.heading("name", text="公司名称", anchor="w")
+        company_tree.column("name", stretch=True, anchor="w")
+        company_tree.heading("link", text="", anchor="center")
+        company_tree.column("link", width=36, stretch=False, anchor="center")
+
+        company_tree_scrollbar = ttk.Scrollbar(company_tree_frame, orient="vertical", command=company_tree.yview)
+        company_tree.configure(yscrollcommand=company_tree_scrollbar.set)
+
+        company_tree.pack(side="left", fill="both", expand=True)
+        company_tree_scrollbar.pack(side="right", fill="y")
+
+        # 样式：选中行底色（与其他标签页一致）
+        company_tree.tag_configure("checked", background="#d4edda")
+        company_tree.tag_configure("unchecked", background="")
+        company_tree.tag_configure("even", background="#f8f8f8")
+        company_tree.tag_configure("even_checked", background="#c3e6cb")
+
+        company_tree_iids = []  # 当前搜索结果的所有 iid
+        company_slugs = {}     # iid -> slug（用于 IGDB 链接）
+
+        def on_company_tree_click(event):
+            region = company_tree.identify_region(event.x, event.y)
+            if region not in ("cell", "tree"):
+                return
+            iid = company_tree.identify_row(event.y)
+            if not iid or iid.startswith("_"):
+                return
+            col = company_tree.identify_column(event.x)
+
+            # 点击链接列 → 打开 IGDB 页面
+            if col == "#2":
+                slug = company_slugs.get(iid, "")
+                if slug:
+                    webbrowser.open(f"https://www.igdb.com/companies/{slug}")
+                return
+
+            key = iid
+            if key in igdb_check_vars:
+                var = igdb_check_vars[key][0]
+                new_val = not var.get()
+                var.set(new_val)
+                current_text = company_tree.item(iid, "values")[0]
+                link_text = company_tree.item(iid, "values")[1] if len(company_tree.item(iid, "values")) > 1 else ""
+                try:
+                    idx = company_tree.index(iid)
+                except Exception:
+                    idx = 0
+                if new_val:
+                    new_text = current_text.replace("☐", "☑", 1)
+                    tag = "even_checked" if idx % 2 == 0 else "checked"
+                else:
+                    new_text = current_text.replace("☑", "☐", 1)
+                    tag = "even" if idx % 2 == 0 else "unchecked"
+                company_tree.item(iid, values=(new_text, link_text), tags=(tag,))
+
+        company_tree.bind("<ButtonRelease-1>", on_company_tree_click)
+
+        # 禁止拖拽列分隔线
+        def block_company_separator(event):
+            if company_tree.identify_region(event.x, event.y) == "separator":
+                return "break"
+        company_tree.bind("<Button-1>", block_company_separator)
+
+        # 提示文字
+        company_tree.insert("", "end", iid="_placeholder",
+                            values=("输入开发商或发行商名称（如 Capcom、Valve），然后点击搜索", ""), tags=("unchecked",))
+
+        def _populate_igdb_tab(dim_key, items, game_counts):
+            """用数据填充某个维度的标签页（Treeview 版本）"""
+            tw = igdb_tab_widgets[dim_key]
+            tree = tw["tree"]
+            dim_info = self.core.IGDB_DIMENSIONS[dim_key]
+
+            # 清空现有内容
+            for iid in tree.get_children():
+                tree.delete(iid)
+            tw["all_iids"].clear()
+            tw["iid_name_map"].clear()
+            tw["item_slugs"].clear()
+            tw["detached_iids"].clear()
+
+            if not items:
+                tree.insert("", "end", iid="_empty",
+                            values=("未找到分类项", ""), tags=("unchecked",))
+                return
+
+            # 对于大维度（如关键词、系列），只显示有 Steam 游戏的条目
+            if game_counts and len(items) > 100:
+                items = [item for item in items if game_counts.get(item.get('id', 0), 0) > 0]
+
+            # 按游戏数降序排列
+            if game_counts:
+                items.sort(key=lambda x: (-game_counts.get(x.get('id', 0), 0), x.get('name', '')))
+
+            for i, item in enumerate(items):
+                item_id = item.get('id')
+                item_name = item.get('name', '未知')
+                item_slug = item.get('slug', '')
+                count = game_counts.get(item_id, 0)
+                display_text = f"☐  {item_name}  ({count} 个游戏)" if count > 0 else f"☐  {item_name}"
+                link_text = "🔗" if item_slug else ""
+
+                key = f"igdb_{dim_key}_{item_id}"
+                var = tk.BooleanVar(value=False)
+                igdb_check_vars[key] = (var, "igdb_category", (dim_key, item_id), f"{dim_info['label']} {item_name}")
+
+                tags = ("even",) if i % 2 == 0 else ("unchecked",)
+                tree.insert("", "end", iid=key, values=(display_text, link_text), tags=tags)
+
+                tw["all_iids"].append(key)
+                tw["iid_name_map"][key] = item_name.lower()
+                if item_slug:
+                    tw["item_slugs"][key] = item_slug
+
+        def load_igdb_dimension_list(dim_key=None):
+            """加载指定维度（或当前选中标签页维度）的分类项列表"""
+            if not igdb_configured:
+                return
+
+            if dim_key is None:
+                current_tab_idx = igdb_notebook.index("current")
+                dim_keys = list(self.core.IGDB_DIMENSIONS.keys())
+                dim_key = dim_keys[current_tab_idx]
+
+            if igdb_loaded_dims.get(dim_key):
+                return
+
+            tw = igdb_tab_widgets[dim_key]
+            tree = tw["tree"]
+
+            # 清空并显示加载中
+            for iid in tree.get_children():
+                tree.delete(iid)
+            tree.insert("", "end", iid="_loading",
+                        values=("正在加载分类列表...", ""), tags=("unchecked",))
+
+            def fetch_thread():
+                items, error = self.core.fetch_igdb_dimension_list(dim_key)
+                game_counts = self.core.get_igdb_dimension_game_counts(dim_key)
+
+                def update_ui():
+                    # 清空加载提示
+                    for iid in tree.get_children():
+                        tree.delete(iid)
+
+                    if error:
+                        tree.insert("", "end", iid="_error",
+                                    values=(f"❌ 加载失败：{error}", ""), tags=("unchecked",))
+                        return
+
+                    _populate_igdb_tab(dim_key, items, game_counts)
+                    igdb_loaded_dims[dim_key] = True
+
+                rec_win.after(0, update_ui)
+
+            threading.Thread(target=fetch_thread, daemon=True).start()
+
+        def load_all_igdb_tabs():
+            """加载所有维度的分类列表"""
+            if not igdb_configured:
+                return
+            for dim_key in self.core.IGDB_DIMENSIONS:
+                if not igdb_loaded_dims.get(dim_key):
+                    load_igdb_dimension_list(dim_key)
+
+        # IGDB 按钮区域（不再需要"加载分类列表"按钮，窗口打开时自动加载）
         igdb_btn_frame = tk.Frame(igdb_frame)
         igdb_btn_frame.pack(fill="x", pady=(5, 0))
 
-        tk.Button(igdb_btn_frame, text="📋 加载类型列表", command=load_igdb_genres,
-                  font=("微软雅黑", 8), state="normal" if igdb_configured else "disabled").pack(side="left",
-                                                                                                padx=(0, 5))
-
         def select_all_igdb():
+            """全选当前标签页的所有可见项"""
+            current_tab_idx = igdb_notebook.index("current")
+            dim_keys = list(self.core.IGDB_DIMENSIONS.keys())
+            if current_tab_idx >= len(dim_keys):
+                # 公司标签页：全选当前搜索结果
+                for k, v in igdb_check_vars.items():
+                    if k.startswith("igdb_company_"):
+                        v[0].set(True)
+                for iid in company_tree_iids:
+                    vals = company_tree.item(iid, "values")
+                    if vals and vals[0].startswith("☐"):
+                        try:
+                            idx = company_tree.index(iid)
+                        except Exception:
+                            idx = 0
+                        link = vals[1] if len(vals) > 1 else ""
+                        company_tree.item(iid, values=(vals[0].replace("☐", "☑", 1), link),
+                                          tags=("even_checked",) if idx % 2 == 0 else ("checked",))
+                return
+            dim_key = dim_keys[current_tab_idx]
+            tw = igdb_tab_widgets[dim_key]
+            tree = tw["tree"]
+            query = tw["search_var"].get().strip().lower()
             for k, v in igdb_check_vars.items():
-                v[0].set(True)
+                if k.startswith(f"igdb_{dim_key}_"):
+                    if query:
+                        item_name = v[3].split(" ", 1)[-1].lower() if " " in v[3] else v[3].lower()
+                        if query in item_name:
+                            v[0].set(True)
+                    else:
+                        v[0].set(True)
+            # 更新 Treeview 显示
+            for iid in tree.get_children():
+                if iid.startswith("_"):
+                    continue
+                vals = tree.item(iid, "values")
+                if vals and len(vals) >= 1 and vals[0].startswith("☐"):
+                    key = iid
+                    if key in igdb_check_vars and igdb_check_vars[key][0].get():
+                        tree.item(iid, values=(vals[0].replace("☐", "☑", 1), vals[1] if len(vals) > 1 else ""),
+                                  tags=("checked",) if tree.index(iid) % 2 != 0 else ("even_checked",))
 
         def deselect_all_igdb():
+            """取消全选当前标签页"""
+            current_tab_idx = igdb_notebook.index("current")
+            dim_keys = list(self.core.IGDB_DIMENSIONS.keys())
+            if current_tab_idx >= len(dim_keys):
+                # 公司标签页：取消全选当前搜索结果
+                for k, v in igdb_check_vars.items():
+                    if k.startswith("igdb_company_"):
+                        v[0].set(False)
+                for iid in company_tree_iids:
+                    vals = company_tree.item(iid, "values")
+                    if vals and vals[0].startswith("☑"):
+                        try:
+                            idx = company_tree.index(iid)
+                        except Exception:
+                            idx = 0
+                        link = vals[1] if len(vals) > 1 else ""
+                        company_tree.item(iid, values=(vals[0].replace("☑", "☐", 1), link),
+                                          tags=("even",) if idx % 2 == 0 else ("unchecked",))
+                return
+            dim_key = dim_keys[current_tab_idx]
+            tw = igdb_tab_widgets[dim_key]
+            tree = tw["tree"]
             for k, v in igdb_check_vars.items():
-                v[0].set(False)
+                if k.startswith(f"igdb_{dim_key}_"):
+                    v[0].set(False)
+            # 更新 Treeview 显示
+            for iid in tree.get_children():
+                if iid.startswith("_"):
+                    continue
+                vals = tree.item(iid, "values")
+                if vals and len(vals) >= 1 and vals[0].startswith("☑"):
+                    tree.item(iid, values=(vals[0].replace("☑", "☐", 1), vals[1] if len(vals) > 1 else ""),
+                              tags=("even",) if tree.index(iid) % 2 == 0 else ("unchecked",))
 
-        tk.Button(igdb_btn_frame, text="☑️ 全选类型", command=select_all_igdb, font=("微软雅黑", 8)).pack(side="left",
+        tk.Button(igdb_btn_frame, text="☑️ 全选当前页", command=select_all_igdb, font=("微软雅黑", 8)).pack(side="left",
                                                                                                           padx=(0, 5))
-        tk.Button(igdb_btn_frame, text="☐ 取消全选类型", command=deselect_all_igdb, font=("微软雅黑", 8)).pack(
+        tk.Button(igdb_btn_frame, text="☐ 取消全选当前页", command=deselect_all_igdb, font=("微软雅黑", 8)).pack(
             side="left", padx=(0, 5))
 
         def force_rescan_igdb():
@@ -1097,7 +1549,6 @@ class SteamToolbox:
                     def _up():
                         status_var.set(phase)
                         detail_var.set(detail)
-                        # 真进度条：total>0 表示已知总量
                         if total > 0:
                             progress_bar.config(mode='determinate', maximum=total)
                             progress_bar['value'] = current
@@ -1126,10 +1577,16 @@ class SteamToolbox:
                     for btn in btn_widgets:
                         btn.config(state="normal")
                     refresh_igdb_cache_status()
+
+                    # 重新加载已打开的标签页
+                    igdb_loaded_dims.clear()
+                    igdb_check_vars.clear()
+
                     if error:
                         status_var.set(f"❌ 下载失败：{error}")
                     else:
                         status_var.set("✅ IGDB 数据下载完成！")
+                        load_all_igdb_tabs()
 
                 rec_win.after(0, done)
 
@@ -1152,11 +1609,17 @@ class SteamToolbox:
                 else:
                     age_str = f"{age_hours / 24:.1f} 天前"
                 if summary.get('is_full_dump'):
+                    dims = summary.get('dimensions', {})
+                    dim_parts = []
+                    for dk, dv in dims.items():
+                        label = self.core.IGDB_DIMENSIONS.get(dk, {}).get("label", dk)
+                        dim_parts.append(f"{label}{dv['count']}")
+                    dim_str = "、".join(dim_parts) if dim_parts else f"{summary.get('total_items', 0)} 个分类"
                     igdb_cache_var.set(
-                        f"💾 已下载：{summary['total_steam_games']} 个 Steam 游戏，{summary['total_genres']} 个类型（{age_str}更新）")
+                        f"💾 已下载：{summary['total_steam_games']} 个 Steam 游戏 | {dim_str}（{age_str}更新）")
                 else:
                     igdb_cache_var.set(
-                        f"💾 已缓存：{summary['total_genres']} 个类型，共 {summary['total_games']} 个游戏（{age_str}更新）")
+                        f"💾 已缓存：{summary.get('total_items', 0)} 个分类，共 {summary['total_games']} 个游戏（{age_str}更新）")
                 igdb_cache_label.config(fg="#2e7d32")
             else:
                 igdb_cache_var.set("💾 尚未下载（首次使用时自动下载，约 5-8 分钟）")
@@ -1167,7 +1630,11 @@ class SteamToolbox:
         # 提示信息
         tk.Label(igdb_frame,
                  text="💡 首次使用时会自动从 IGDB 下载所有 Steam 游戏的分类数据（约 5-8 分钟），之后筛选均为本地秒查",
-                 font=("微软雅黑", 8), fg="#666", wraplength=500, justify="left").pack(anchor="w", pady=(3, 0))
+                 font=("微软雅黑", 8), fg="#666", wraplength=400, justify="left").pack(anchor="w", pady=(3, 0))
+
+        # 自动加载所有 IGDB 标签页数据（无需手动点击按钮）
+        if igdb_configured:
+            rec_win.after(200, load_all_igdb_tabs)
 
         # ===== 状态显示 =====
         status_var = tk.StringVar(value="请勾选要获取的来源，然后点击下方按钮。")
@@ -1275,28 +1742,49 @@ class SteamToolbox:
                         else:
                             update_status(f"❌ {name}: 无法解析 URL")
 
-                    elif src_type == "igdb_genre":
-                        # IGDB 游戏类型抓取
-                        genre_id = url_or_id
-                        genre_name = name.replace("🏷️ ", "")  # 移除前缀用于显示
+                    elif src_type == "igdb_category":
+                        # IGDB 多维度分类抓取
+                        dimension, item_id = url_or_id  # url_or_id 是 (dimension, item_id) 元组
+                        # 移除维度前缀 emoji 用于显示
+                        display_name = name
+                        for dim_info in self.core.IGDB_DIMENSIONS.values():
+                            display_name = display_name.replace(dim_info["label"] + " ", "")
 
                         def igdb_progress_cb(fetched, total_count, phase, detail):
                             update_status(f"正在获取 [{i + 1}/{total}]: {name} ({phase})", detail)
 
-                        ids, error = self.core.fetch_igdb_games_by_genre(genre_id, genre_name, igdb_progress_cb,
-                                                                     force_refresh=igdb_force_refresh[0])
+                        ids, error = self.core.fetch_igdb_games_by_dimension(
+                            dimension, item_id, display_name, igdb_progress_cb,
+                            force_refresh=igdb_force_refresh[0])
 
                         if error:
                             update_status(f"❌ {name}: {error}")
                         else:
                             fetched_data[key] = {'ids': ids, 'name': name}
                             # 检查是否来自缓存
-                            cached_ids, cached_at = self.core.get_igdb_genre_cache(genre_id)
+                            cached_ids, cached_at = self.core.get_igdb_dimension_cache(dimension, item_id)
                             if not igdb_force_refresh[0] and cached_ids is not None and self.core.is_igdb_cache_valid(
                                     cached_at):
                                 update_status(f"✅ {name}: {len(ids)} 个游戏（本地缓存）")
                             else:
                                 update_status(f"✅ {name}: 获取 {len(ids)} 个游戏（已缓存）")
+
+                    elif src_type == "igdb_company":
+                        # IGDB 公司（开发商/发行商）
+                        company_id = url_or_id
+                        company_name = name.replace("🏢 ", "")
+
+                        def company_progress_cb(fetched, total_count, phase, detail):
+                            update_status(f"正在获取 [{i + 1}/{total}]: {name} ({phase})", detail)
+
+                        ids, error = self.core.fetch_igdb_games_by_company(
+                            company_id, company_name, company_progress_cb)
+
+                        if error:
+                            update_status(f"❌ {name}: {error}")
+                        else:
+                            fetched_data[key] = {'ids': ids, 'name': name}
+                            update_status(f"✅ {name}: 获取 {len(ids)} 个游戏")
 
                     time.sleep(0.3)
 
@@ -1319,6 +1807,19 @@ class SteamToolbox:
                         pass
 
                     if fetched_data:
+                        # 如果开启了合并模式，将所有来源合并为一个
+                        if merge_var.get() and len(fetched_data) > 1:
+                            all_ids = set()
+                            all_names = []
+                            for d in fetched_data.values():
+                                all_ids.update(d['ids'])
+                                all_names.append(d['name'])
+                            merged_name = " + ".join(all_names)
+                            if len(merged_name) > 60:
+                                merged_name = merged_name[:57] + f"…（共 {len(all_names)} 个来源）"
+                            fetched_data.clear()
+                            fetched_data["_merged"] = {'ids': sorted(all_ids), 'name': merged_name}
+
                         total_ids = sum(len(d['ids']) for d in fetched_data.values())
                         status_var.set(f"✅ 获取完成！共 {len(fetched_data)} 个来源，{total_ids} 个游戏。")
                         status_label.config(fg="green")
@@ -1332,6 +1833,13 @@ class SteamToolbox:
 
             threading.Thread(target=fetch_thread, daemon=True).start()
 
+        # ===== 合并模式选项 =====
+        merge_var = tk.BooleanVar(value=False)
+        merge_frame = tk.Frame(rec_win)
+        merge_frame.pack(pady=(5, 0))
+        tk.Checkbutton(merge_frame, text="🔗 合并所有勾选来源（取并集后作为一个来源导入/导出/更新）",
+                        variable=merge_var, font=("微软雅黑", 9)).pack()
+
         # ===== 操作按钮 =====
         btn_frame = tk.Frame(rec_win)
         btn_frame.pack(pady=15)
@@ -1343,7 +1851,7 @@ class SteamToolbox:
                 # 创建名称编辑窗口，允许用户在导入前修改名称
                 name_win = tk.Toplevel()
                 name_win.title("确认收藏夹名称")
-                name_win.attributes("-topmost", True)
+                # （不再强制置顶）
 
                 tk.Label(name_win, text="请确认或修改收藏夹名称：",
                          font=("微软雅黑", 10, "bold")).pack(pady=(15, 10), padx=20)
@@ -1399,7 +1907,7 @@ class SteamToolbox:
                     self.core.save_json(data, backup_description="从个人推荐分类创建收藏夹")
                     messagebox.showinfo("成功", f"已创建 {len(fetched_data)} 个收藏夹。" + self.disclaimer)
                     name_win.destroy()
-                    rec_win.destroy()
+                    self._ui_refresh()
 
                 btn_row = tk.Frame(name_win)
                 btn_row.pack(pady=15)
@@ -1437,10 +1945,9 @@ class SteamToolbox:
 
                 def on_done():
                     self.core.save_json(data, backup_description="从个人推荐分类更新收藏夹")
-                    rec_win.destroy()
+                    self._ui_refresh()
 
                 self.show_batch_update_mapping(data, all_cols, sources, on_done,
-                                                         parent_to_close=rec_win,
                                                          saved_mappings_key="recommend_update_mappings")
 
             fetch_and_execute('update', update_action)
@@ -1468,7 +1975,7 @@ class SteamToolbox:
 
         db_win = tk.Toplevel()
         db_win.title("从 SteamDB 列表页面获取游戏")
-        db_win.attributes("-topmost", True)
+        # （不再强制置顶）
 
         tk.Label(db_win,
                  text="使用指南：\n1. 在浏览器打开 SteamDB 列表页面，右键 →「另存为」保存完整网页源代码。\n2. 如需合并多个列表，重复保存即可。\n3. 点击下方按钮选择所有已保存的 HTML 文件。",
@@ -1585,7 +2092,7 @@ class SteamToolbox:
 
         bk_win = tk.Toplevel()
         bk_win.title("管理收藏夹备份")
-        bk_win.attributes("-topmost", True)
+        # （不再强制置顶）
 
         # 当前账号信息
         account_frame = tk.Frame(bk_win, bg="#f0f0f0", pady=8)
@@ -1735,7 +2242,7 @@ class SteamToolbox:
 
         diff_win = tk.Toplevel()
         diff_win.title(f"差异对比: {backup_filename} ↔ 当前文件")
-        diff_win.attributes("-topmost", True)
+        # （不再强制置顶）
 
         # 摘要信息
         summary = diff_result['summary']
@@ -1869,7 +2376,7 @@ class SteamToolbox:
         """打开全局 Cookie 管理界面"""
         cookie_win = tk.Toplevel()
         cookie_win.title("管理登录态 Cookie")
-        cookie_win.attributes("-topmost", True)
+        # （不再强制置顶）
 
         # 说明区域
         guide_frame = tk.Frame(cookie_win)
@@ -1965,7 +2472,7 @@ class SteamToolbox:
         """打开 IGDB API 凭证管理界面"""
         igdb_win = tk.Toplevel()
         igdb_win.title("管理 IGDB API 凭证")
-        igdb_win.attributes("-topmost", True)
+        # （不再强制置顶）
 
         # 说明区域
         guide_frame = tk.Frame(igdb_win)
